@@ -57,14 +57,10 @@ async function nPut(uri: string, body: unknown) {
   return res.json()
 }
 
-// stats — GET /stats (12시간 캐시, 하루 최대 2회)
-async function nStats(ids: string[], days = 30) {
+// stats — GET /stats (캐시 TTL 가변)
+async function nStats(ids: string[], since: string, until: string, ckey: string, ttl = TTL_12H) {
   if (!ids.length) return []
-  const ckey = '__stats__' + days
-  if (cache[ckey] && Date.now() - cache[ckey].ts < TTL_12H) return cache[ckey].data
-
-  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0,10)
-  const until = new Date().toISOString().slice(0,10)
+  if (cache[ckey] && Date.now() - cache[ckey].ts < ttl) return cache[ckey].data
   const uri = '/stats'
   const params = new URLSearchParams({
     ids: ids.join(','),
@@ -84,9 +80,14 @@ async function nStats(ids: string[], days = 30) {
 }
 
 // ── /api/data ─────────────────────────────────────────────────────────────────
-// 캠페인(1) + 광고그룹(1) + 키워드(그룹수) + stats(1) = 최대 5회, 이후 캐시
+// 캠페인(1) + 광고그룹(1) + 키워드(그룹수) + stats30일(1) + stats이번달(1) = 최대 6회, 이후 캐시
 app.get('/api/data', async (c) => {
   try {
+    const now   = new Date()
+    const today = now.toISOString().slice(0,10)
+    const since30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0,10)
+    const monthStart = today.slice(0,7) + '-01'
+
     const [camps, adgroups] = await Promise.all([
       nGet('/ncc/campaigns') as Promise<any[]>,
       nGet('/ncc/adgroups')  as Promise<any[]>,
@@ -98,38 +99,46 @@ app.get('/api/data', async (c) => {
       )
     )
     const allKw: any[] = (kwBatch as any[][]).flat()
-
-    // 운영 키워드만 (제외 키워드 완전 제거)
     const activeKw = allKw.filter((k: any) => !EXCLUDE.has(k.keyword))
-
-    // stats: 운영 키워드 ID만 조회 (크레딧 절약)
     const ids = activeKw.map((k: any) => k.nccKeywordId)
-    const statsRaw: any[] = await nStats(ids, 30) as any[]
 
-    // 키워드별 30일 합산
-    const statsMap: Record<string, { imp: number; clk: number; cost: number }> = {}
-    for (const row of statsRaw) {
-      const id = row.id
-      const s = row.statData || row.stat || {}
-      if (!statsMap[id]) statsMap[id] = { imp: 0, clk: 0, cost: 0 }
-      statsMap[id].imp  += Number(s.impCnt  || 0)
-      statsMap[id].clk  += Number(s.clkCnt  || 0)
-      statsMap[id].cost += Number(s.salesAmt || 0)
+    // stats 2종 병렬 (캐시 키 분리, 각각 12h)
+    const [statsRaw30, statsRawMonth] = await Promise.all([
+      nStats(ids, since30,    today, '__stats30__',    TTL_12H) as Promise<any[]>,
+      nStats(ids, monthStart, today, '__statsMonth__', TTL_12H) as Promise<any[]>,
+    ])
+
+    // 합산 함수
+    function sumStats(rows: any[]) {
+      const m: Record<string, { imp:number; clk:number; cost:number }> = {}
+      for (const row of rows) {
+        const id = row.id
+        const s = row.statData || row.stat || {}
+        if (!m[id]) m[id] = { imp:0, clk:0, cost:0 }
+        m[id].imp  += Number(s.impCnt  || 0)
+        m[id].clk  += Number(s.clkCnt  || 0)
+        m[id].cost += Number(s.salesAmt || 0)
+      }
+      return m
     }
+    const map30    = sumStats(statsRaw30)
+    const mapMonth = sumStats(statsRawMonth)
 
     const keywords = activeKw.map((k: any) => {
-      const st = statsMap[k.nccKeywordId] || { imp:0, clk:0, cost:0 }
-      const ctr  = st.imp > 0 ? +(st.clk / st.imp * 100).toFixed(1) : 0
-      const acpc = st.clk > 0 ? Math.round(st.cost / st.clk) : 0
+      const s30 = map30[k.nccKeywordId]    || { imp:0, clk:0, cost:0 }
+      const sm  = mapMonth[k.nccKeywordId] || { imp:0, clk:0, cost:0 }
+      const ctr  = s30.imp > 0 ? +(s30.clk / s30.imp * 100).toFixed(1) : 0
+      const acpc = s30.clk > 0 ? Math.round(s30.cost / s30.clk) : 0
       return {
-        id:      k.nccKeywordId,
-        agId:    k.nccAdgroupId,
-        keyword: k.keyword,
-        bidAmt:  k.bidAmt,
-        status:  k.status,
-        imp:     st.imp,
-        clk:     st.clk,
-        cost:    st.cost,
+        id:        k.nccKeywordId,
+        agId:      k.nccAdgroupId,
+        keyword:   k.keyword,
+        bidAmt:    k.bidAmt,
+        status:    k.status,
+        imp:       s30.imp,
+        clk:       s30.clk,
+        cost:      s30.cost,      // 30일 비용
+        costMonth: sm.cost,       // 이번달 비용
         ctr,
         acpc,
       }
@@ -138,9 +147,30 @@ app.get('/api/data', async (c) => {
     const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
     const isOn = mainCamp && !mainCamp.userLock && mainCamp.status === 'ELIGIBLE'
 
+    // 예산 계산
+    const dailyBudget    = mainCamp?.dailyBudget || 0
+    const totalUsedMonth = keywords.reduce((s: number, k: any) => s + k.costMonth, 0)
+    const totalUsed30    = keywords.reduce((s: number, k: any) => s + k.cost, 0)
+    // 오늘 소진 추정: stats는 전날까지만 정확 → totalChargeCost 사용
+    const todayUsed      = Number(mainCamp?.totalChargeCost || 0)
+    const todayRemain    = Math.max(0, dailyBudget - todayUsed)
+
     return c.json({
       ok: true, isOn,
-      camp: mainCamp ? { name: mainCamp.name, status: mainCamp.status, dailyBudget: mainCamp.dailyBudget } : null,
+      camp: mainCamp ? {
+        name:            mainCamp.name,
+        status:          mainCamp.status,
+        dailyBudget,
+        totalChargeCost: mainCamp.totalChargeCost || 0,
+      } : null,
+      budget: {
+        daily:        dailyBudget,
+        todayUsed,
+        todayRemain,
+        monthUsed:    totalUsedMonth,
+        total30Used:  totalUsed30,
+        monthLabel:   today.slice(0,7),   // '2026-06'
+      },
       keywords,
       regions: REGIONS,
       cachedAt: new Date().toISOString(),
@@ -231,16 +261,16 @@ body{background:#0a0d14;color:#e2e8f0;min-height:100vh}
 <main style="max-width:1280px;margin:0 auto;padding:20px">
 
   <!-- KPI 4개 -->
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px">
     <div class="card" style="padding:18px 20px">
       <div style="font-size:11px;color:#4a5568;margin-bottom:8px;font-weight:500">광고 상태</div>
       <div id="k-status" style="font-size:22px;font-weight:700;color:#fc8181">OFF</div>
-      <div id="k-budget" style="font-size:11px;color:#334155;margin-top:5px">—</div>
+      <div id="k-budget-label" style="font-size:11px;color:#334155;margin-top:5px">—</div>
     </div>
     <div class="card" style="padding:18px 20px">
       <div style="font-size:11px;color:#4a5568;margin-bottom:8px;font-weight:500">운영 키워드</div>
       <div id="k-active" style="font-size:22px;font-weight:700;color:#03C75A">—</div>
-      <div style="font-size:11px;color:#334155;margin-top:5px">15개 지역 × 전체</div>
+      <div style="font-size:11px;color:#334155;margin-top:5px">15개 지역 전체 노출</div>
     </div>
     <div class="card" style="padding:18px 20px">
       <div style="font-size:11px;color:#4a5568;margin-bottom:8px;font-weight:500">30일 실제 비용</div>
@@ -251,6 +281,48 @@ body{background:#0a0d14;color:#e2e8f0;min-height:100vh}
       <div style="font-size:11px;color:#4a5568;margin-bottom:8px;font-weight:500">30일 클릭 · CPC</div>
       <div id="k-clk" style="font-size:22px;font-weight:700;color:#63b3ed">—</div>
       <div id="k-acpc" style="font-size:11px;color:#334155;margin-top:5px">평균 CPC —</div>
+    </div>
+  </div>
+
+  <!-- 예산 현황 바 -->
+  <div class="card" style="padding:16px 20px;margin-bottom:20px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <div style="font-size:13px;font-weight:700;color:#e2e8f0">
+        <i class="fas fa-wallet" style="color:#f6ad55;margin-right:6px"></i>예산 현황
+      </div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap">
+        <div style="text-align:center">
+          <div style="font-size:10px;color:#4a5568;margin-bottom:2px">일예산</div>
+          <div id="b-daily" style="font-size:14px;font-weight:700;color:#e2e8f0">—</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:10px;color:#4a5568;margin-bottom:2px">오늘 사용</div>
+          <div id="b-today-used" style="font-size:14px;font-weight:700;color:#f6e05e">—</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:10px;color:#4a5568;margin-bottom:2px">오늘 남은 예산</div>
+          <div id="b-today-remain" style="font-size:14px;font-weight:700;color:#03C75A">—</div>
+        </div>
+        <div style="width:1px;background:#1e2a3a"></div>
+        <div style="text-align:center">
+          <div id="b-month-label" style="font-size:10px;color:#4a5568;margin-bottom:2px">이번달 누적</div>
+          <div id="b-month-used" style="font-size:14px;font-weight:700;color:#a78bfa">—</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:10px;color:#4a5568;margin-bottom:2px">일평균 소진</div>
+          <div id="b-daily-avg" style="font-size:14px;font-weight:700;color:#63b3ed">—</div>
+        </div>
+      </div>
+    </div>
+    <!-- 일예산 소진 바 -->
+    <div>
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:#4a5568;margin-bottom:4px">
+        <span>일예산 소진율</span>
+        <span id="b-pct-label">0%</span>
+      </div>
+      <div style="height:8px;background:#0d1020;border-radius:4px;overflow:hidden">
+        <div id="b-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#03C75A,#f6e05e);border-radius:4px;transition:width .6s ease"></div>
+      </div>
     </div>
   </div>
 
@@ -382,7 +454,7 @@ body{background:#0a0d14;color:#e2e8f0;min-height:100vh}
             <span style="font-size:12px;font-weight:700;color:#63b3ed">1시간</span>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-size:12px;color:#4a5568">stats API 캐시</span>
+            <span style="font-size:12px;color:#4a5568">stats API 캐시 (2종)</span>
             <span style="font-size:12px;font-weight:700;color:#f6e05e">12시간</span>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center">
@@ -430,16 +502,45 @@ async function hardRefresh() {
 
 function renderAll() {
   renderKPI()
+  renderBudget()
   renderStatus()
   renderTable()
   renderBidSelect()
   const now = new Date(D.cachedAt)
   document.getElementById('last-update').textContent =
     now.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) + ' 기준'
-  // 캐시 경과 표시
   const ageMins = Math.floor((Date.now() - new Date(D.cachedAt).getTime()) / 60000)
   document.getElementById('cache-age').textContent =
     ageMins < 1 ? '방금 갱신됨' : ageMins + '분 전 캐시'
+}
+
+function renderBudget() {
+  const b = D.budget || {}
+  const daily      = b.daily      || 0
+  const todayUsed  = b.todayUsed  || 0
+  const todayRemain= b.todayRemain|| daily
+  const monthUsed  = b.monthUsed  || 0
+  const month      = b.monthLabel || ''
+
+  // 일평균: 이번달 1일~오늘까지 일수
+  const dayOfMonth = new Date().getDate()
+  const dailyAvg   = dayOfMonth > 0 ? Math.round(monthUsed / dayOfMonth) : 0
+
+  // 소진율
+  const pct = daily > 0 ? Math.min(100, Math.round(todayUsed / daily * 100)) : 0
+
+  document.getElementById('b-daily').textContent       = daily.toLocaleString() + '원'
+  document.getElementById('b-today-used').textContent  = todayUsed > 0 ? todayUsed.toLocaleString() + '원' : '0원'
+  document.getElementById('b-today-remain').textContent= todayRemain.toLocaleString() + '원'
+  document.getElementById('b-month-label').textContent = month ? month.slice(5) + '월 누적 비용' : '이번달 누적'
+  document.getElementById('b-month-used').textContent  = monthUsed > 0 ? monthUsed.toLocaleString() + '원' : '0원'
+  document.getElementById('b-daily-avg').textContent   = dailyAvg > 0 ? dailyAvg.toLocaleString() + '원/일' : '—'
+  document.getElementById('b-pct-label').textContent   = pct + '%'
+  document.getElementById('b-bar').style.width         = pct + '%'
+  // 바 색상: 80% 이상이면 빨간색
+  if (pct >= 80) document.getElementById('b-bar').style.background = 'linear-gradient(90deg,#f6e05e,#fc8181)'
+  else if (pct >= 50) document.getElementById('b-bar').style.background = 'linear-gradient(90deg,#03C75A,#f6e05e)'
+  else document.getElementById('b-bar').style.background = 'linear-gradient(90deg,#03C75A,#4ade80)'
 }
 
 function renderKPI() {
@@ -450,16 +551,17 @@ function renderKPI() {
   const hasData = totalCost > 0 || totalClk > 0
 
   const isOn = D.isOn
-  document.getElementById('k-status').textContent  = isOn ? '광고 ON' : '광고 OFF'
-  document.getElementById('k-status').style.color  = isOn ? '#03C75A' : '#fc8181'
-  document.getElementById('k-budget').textContent  =
-    D.camp ? '일예산 ' + (D.camp.dailyBudget||0).toLocaleString() + '원' : '—'
+  document.getElementById('k-status').textContent      = isOn ? '광고 ON' : '광고 OFF'
+  document.getElementById('k-status').style.color      = isOn ? '#03C75A' : '#fc8181'
+  document.getElementById('k-budget-label').textContent= D.camp
+    ? '일예산 ' + (D.camp.dailyBudget||0).toLocaleString() + '원'
+    : '—'
 
-  document.getElementById('k-active').textContent  = kws.length + '개'
-  document.getElementById('k-cost').textContent    = hasData ? totalCost.toLocaleString() + '원' : '—'
-  document.getElementById('k-cost-sub').textContent = hasData ? '30일 누적 · VAT 포함' : '광고 집행 후 표시'
-  document.getElementById('k-clk').textContent     = hasData ? totalClk.toLocaleString() + '회' : '—'
-  document.getElementById('k-acpc').textContent    = hasData
+  document.getElementById('k-active').textContent      = kws.length + '개'
+  document.getElementById('k-cost').textContent        = hasData ? totalCost.toLocaleString() + '원' : '—'
+  document.getElementById('k-cost-sub').textContent    = hasData ? '30일 누적 · VAT 포함' : '광고 집행 후 표시'
+  document.getElementById('k-clk').textContent         = hasData ? totalClk.toLocaleString() + '회' : '—'
+  document.getElementById('k-acpc').textContent        = hasData
     ? '평균 CPC ' + acpc.toLocaleString() + '원'
     : '집행 후 표시'
 
