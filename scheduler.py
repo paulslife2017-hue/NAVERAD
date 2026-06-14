@@ -236,8 +236,8 @@ def do_on_and_optimize():
     all_kws = [k for k in all_kws if k.get("keyword", "") not in EXCLUDE_KEYWORDS]
     log(f"  → 총 {before}개 중 청소계열 제외 후 {len(all_kws)}개 최적화 대상")
 
-    # ── 3. 검색량/경쟁도 조회 & 입찰가 계산 ────────────────────────────
-    log("── 3단계: 검색량 조회 & 입찰가 계산 (API 크레딧 최소화) ──")
+    # ── 3. 입찰가 계산 (크레딧 절약: keywordstool 미사용, 현재 입찰가 기반) ──
+    log("── 3단계: 입찰가 계산 (API 추가 호출 없음 — 크레딧 절약) ──")
     results = []
     total_daily_est = 0
 
@@ -247,21 +247,9 @@ def do_on_and_optimize():
         ag_id   = kw.get("_agId", "")
         cur_bid = kw.get("bidAmt", 70)
 
-        # keywordstool (1회 호출로 검색량+경쟁도+순위 한번에)
-        d = api_get("/keywordstool", {"hintKeywords": kw_name, "showDetail": "1"})
-        match = None
-        if d and "keywordList" in d:
-            match = next((x for x in d["keywordList"] if x["relKeyword"] == kw_name), None)
-
-        if match:
-            pc  = match["monthlyPcQcCnt"]  if isinstance(match["monthlyPcQcCnt"],  int) else 5
-            mob = match["monthlyMobileQcCnt"] if isinstance(match["monthlyMobileQcCnt"], int) else 5
-            ms    = pc + mob
-            comp  = match.get("compIdx",    "낮음")
-            depth = float(match.get("plAvgDepth", 8))
-        else:
-            ms, comp, depth = 100, "낮음", 8.0
-
+        # keywordstool API 호출 제거 (크레딧 절약 핵심)
+        # 현재 입찰가를 기준으로 ±10% 범위에서 유지
+        ms, comp, depth = 500, "중간", 5.0  # 기본값 사용
         new_bid, reason, changed = calc_smart_bid(kw_name, ms, comp, depth, cur_bid)
         daily_est = int(ms * 0.03 * new_bid / 30)
         total_daily_est += daily_est
@@ -274,7 +262,6 @@ def do_on_and_optimize():
             "daily_est": daily_est,
         })
         log(f"  [{kw_name}] {cur_bid}→{new_bid}원 | {reason[:50]}")
-        time.sleep(0.3)
 
     # ── 4. 일 예산 초과 시 전체 축소 ──────────────────────────────────
     log(f"── 4단계: 예산 체크 (예상 {total_daily_est:,}원 / 한도 {DAILY_BUDGET:,}원) ──")
@@ -312,46 +299,42 @@ def do_on_and_optimize():
             log(f"  ❌ {r['keyword']}: 실패 [{sc}] {res}")
         time.sleep(0.2)
 
-    # ── 6. 실제 비용 조회 (/ncc/stats — 크레딧 1회) ──────────────────
-    log("── 6단계: 실제 비용 조회 (/ncc/stats API 1회 호출) ──")
+    # ── 6. 실제 비용 조회 (GET /stats — 올바른 엔드포인트, 크레딧 1회) ──
+    log("── 6단계: 실제 비용 조회 (GET /stats 1회 호출) ──")
     stats_map = {}  # keyword_id → stats dict
     try:
-        yesterday = (datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
-                     .__class__.fromordinal(datetime.now().toordinal() - 1))
-        date_str = yesterday.strftime("%Y-%m-%d")
-
-        # 키워드 ID 목록 (청소 제외 결과셋 기준)
+        from datetime import timedelta
+        yesterday  = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         kw_ids = [r["kw_id"] for r in results if r["kw_id"]]
         if kw_ids:
-            # stats API: POST /ncc/stats  (배치 방식, 최대 100개)
-            # datePreset 또는 startDate/endDate 사용
-            stats_body = {
-                "ids": kw_ids,
-                "datePreset": "yesterday"
-            }
+            # 올바른 엔드포인트: GET /stats (POST /ncc/stats 는 404)
+            uri_s  = "/stats"
+            import urllib.parse, json as _json
+            params = urllib.parse.urlencode({
+                "ids":       ",".join(kw_ids),
+                "fields":    '["impCnt","clkCnt","salesAmt"]',
+                "timeRange": _json.dumps({"since": yesterday, "until": yesterday}),
+                "timeUnit":  "DAY",
+            })
             ts_s = str(int(time.time() * 1000))
-            uri_s = "/ncc/stats"
-            r_s = requests.post(
-                BASE + uri_s,
-                headers=_hdrs(ts_s, "POST", uri_s),
-                json=stats_body,
+            r_s = requests.get(
+                BASE + uri_s + "?" + params,
+                headers=_hdrs(ts_s, "GET", uri_s),
                 timeout=20,
             )
             if r_s.status_code == 200:
                 sdata = r_s.json()
-                # 응답 형식: {"data": [{"id": "...", "stat": {...}}, ...]}
                 for item in (sdata.get("data") or []):
                     kw_id_s = item.get("id", "")
-                    st = item.get("stat", {})
+                    st = item.get("statData") or item.get("stat") or {}
                     stats_map[kw_id_s] = {
-                        "impressions": int(st.get("impressionCnt",  0) or 0),
-                        "clicks":      int(st.get("clickCnt",       0) or 0),
-                        "actual_cost": int(st.get("salesAmt",       0) or 0),  # VAT 포함
+                        "impressions": int(st.get("impCnt",   0) or 0),
+                        "clicks":      int(st.get("clkCnt",   0) or 0),
+                        "actual_cost": int(st.get("salesAmt", 0) or 0),
                     }
                 log(f"  ✅ stats 조회 성공: {len(stats_map)}개 키워드")
             else:
-                log(f"  ⚠️ stats API 응답 오류 [{r_s.status_code}]: {r_s.text[:200]}")
-                log("    → 실제 비용 없이 계속 진행 (추정값 fallback)")
+                log(f"  ⚠️ stats API [{r_s.status_code}]: {r_s.text[:200]}")
         else:
             log("  → 조회 대상 키워드 없음")
     except Exception as e:
