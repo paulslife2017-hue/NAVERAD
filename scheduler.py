@@ -103,10 +103,17 @@ def init_db():
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             log_date       TEXT NOT NULL,
             keyword        TEXT,
-            estimated_cost INTEGER,
+            ncc_keyword_id TEXT,
+            impressions    INTEGER DEFAULT 0,
+            clicks         INTEGER DEFAULT 0,
+            actual_cost    INTEGER DEFAULT 0,
+            ctr            REAL    DEFAULT 0,
+            avg_cpc        INTEGER DEFAULT 0,
             action         TEXT,
             created_at     TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE INDEX IF NOT EXISTS idx_cost_log_date ON cost_log(log_date);
+        CREATE INDEX IF NOT EXISTS idx_cost_log_kw   ON cost_log(keyword);
     """)
     conn.commit()
     conn.close()
@@ -305,7 +312,53 @@ def do_on_and_optimize():
             log(f"  ❌ {r['keyword']}: 실패 [{sc}] {res}")
         time.sleep(0.2)
 
-    # ── 6. DB 저장 ──────────────────────────────────────────────────
+    # ── 6. 실제 비용 조회 (/ncc/stats — 크레딧 1회) ──────────────────
+    log("── 6단계: 실제 비용 조회 (/ncc/stats API 1회 호출) ──")
+    stats_map = {}  # keyword_id → stats dict
+    try:
+        yesterday = (datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
+                     .__class__.fromordinal(datetime.now().toordinal() - 1))
+        date_str = yesterday.strftime("%Y-%m-%d")
+
+        # 키워드 ID 목록 (청소 제외 결과셋 기준)
+        kw_ids = [r["kw_id"] for r in results if r["kw_id"]]
+        if kw_ids:
+            # stats API: POST /ncc/stats  (배치 방식, 최대 100개)
+            # datePreset 또는 startDate/endDate 사용
+            stats_body = {
+                "ids": kw_ids,
+                "datePreset": "yesterday"
+            }
+            ts_s = str(int(time.time() * 1000))
+            uri_s = "/ncc/stats"
+            r_s = requests.post(
+                BASE + uri_s,
+                headers=_hdrs(ts_s, "POST", uri_s),
+                json=stats_body,
+                timeout=20,
+            )
+            if r_s.status_code == 200:
+                sdata = r_s.json()
+                # 응답 형식: {"data": [{"id": "...", "stat": {...}}, ...]}
+                for item in (sdata.get("data") or []):
+                    kw_id_s = item.get("id", "")
+                    st = item.get("stat", {})
+                    stats_map[kw_id_s] = {
+                        "impressions": int(st.get("impressionCnt",  0) or 0),
+                        "clicks":      int(st.get("clickCnt",       0) or 0),
+                        "actual_cost": int(st.get("salesAmt",       0) or 0),  # VAT 포함
+                    }
+                log(f"  ✅ stats 조회 성공: {len(stats_map)}개 키워드")
+            else:
+                log(f"  ⚠️ stats API 응답 오류 [{r_s.status_code}]: {r_s.text[:200]}")
+                log("    → 실제 비용 없이 계속 진행 (추정값 fallback)")
+        else:
+            log("  → 조회 대상 키워드 없음")
+    except Exception as e:
+        log(f"  ⚠️ stats 조회 예외: {e}")
+
+    # ── 7. DB 저장 (입찰이력 + 실제비용) ──────────────────────────────
+    log("── 7단계: DB 저장 ──")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     for r in results:
@@ -314,11 +367,22 @@ def do_on_and_optimize():
             (run_date, r["keyword"], r["ms"], r["comp"], r["depth"],
              r["old_bid"], r["new_bid"], int(r["changed"]), r["reason"])
         )
-        if r["changed"]:
-            c.execute(
-                "INSERT INTO cost_log (log_date,keyword,estimated_cost,action) VALUES (?,?,?,?)",
-                (run_date, r["keyword"], r["daily_est"], "BID_UPDATE")
-            )
+        # 실제 비용 저장 (stats 있으면 실제값, 없으면 0으로 저장해 날짜 기록 유지)
+        st = stats_map.get(r["kw_id"], {})
+        imp  = st.get("impressions", 0)
+        clk  = st.get("clicks",      0)
+        cost = st.get("actual_cost", 0)
+        ctr  = round(clk / imp * 100, 2) if imp > 0 else 0.0
+        acpc = round(cost / clk) if clk > 0 else 0
+        c.execute(
+            """INSERT OR REPLACE INTO cost_log
+               (log_date,keyword,ncc_keyword_id,impressions,clicks,actual_cost,ctr,avg_cpc,action)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (run_date, r["keyword"], r["kw_id"],
+             imp, clk, cost, ctr, acpc,
+             "ACTUAL" if stats_map.get(r["kw_id"]) else "NO_DATA")
+        )
+        log(f"  [{r['keyword']}] 노출:{imp:,} 클릭:{clk} 비용:{cost:,}원 CTR:{ctr}%")
     conn.commit()
     conn.close()
 
