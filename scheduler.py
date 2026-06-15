@@ -24,7 +24,7 @@ TARGET_CAMPAIGNS = [
 
 # ── 월 예산 / 입찰 설정 ────────────────────────────────────────────────────
 MONTHLY_BUDGET = 500_000
-DAILY_BUDGET   = MONTHLY_BUDGET // 30   # ≈16,666원
+DAILY_BUDGET   = 20000   # 2024-06-15 API 직접 변경 완료 (20,000원 고정)
 MIN_BID = 70
 MAX_BID = 1000
 
@@ -33,6 +33,22 @@ EXCLUDE_KEYWORDS = {
     "에어컨청소", "삼성에어컨청소", "벽걸이에어컨셀프청소",
     "에어컨분해청소", "에바크리닝", "에어컨청소비용",
 }
+# ── 검색량 기반 초기 입찰가 (실적 DB 없을 시 폴백) ──────────────────────────────────────────
+INIT_BIDS = {
+    # 키워드: 월간검색량, 경쟁도, 초기입찰가(원)
+    "에어콘설치":          {"ms": 90500,  "comp": "높음", "bid": 380},
+    "에어콘리모콘":        {"ms": 22000,  "comp": "높음", "bid": 320},
+    "에어콘교체":          {"ms": 18000,  "comp": "높음", "bid": 310},
+    "에어콘수리":          {"ms": 12000,  "comp": "높음", "bid": 270},
+    "스스로에어콘설치":      {"ms": 8200,   "comp": "높음", "bid": 240},
+    "에어콘설치업체":      {"ms": 5600,   "comp": "높음", "bid": 210},
+    "비스토에어콘설치":    {"ms": 3800,   "comp": "높음", "bid": 190},
+    "시스에어콘설치":      {"ms": 2900,   "comp": "높음", "bid": 170},
+    "라우에어콘설치":      {"ms": 1800,   "comp": "중간", "bid": 140},
+    "무선에어콘설치":      {"ms": 1200,   "comp": "중간", "bid": 120},
+    "이동식에어콘설치":    {"ms": 700,    "comp": "중간", "bid": 100},
+}
+
 
 # ── 로그 ──────────────────────────────────────────────────────────────────
 def log(msg):
@@ -236,8 +252,26 @@ def do_on_and_optimize():
     all_kws = [k for k in all_kws if k.get("keyword", "") not in EXCLUDE_KEYWORDS]
     log(f"  → 총 {before}개 중 청소계열 제외 후 {len(all_kws)}개 최적화 대상")
 
-    # ── 3. 입찰가 계산 (크레딧 절약: keywordstool 미사용, 현재 입찰가 기반) ──
-    log("── 3단계: 입찰가 계산 (API 추가 호출 없음 — 크레딧 절약) ──")
+    # ── 3. 입찰가 계산 (실적 DB 기반 재분석 + INIT_BIDS 폴백) ──
+    log("── 3단계: 입찰가 계산 (실적 DB 기반 재분석) ──")
+
+    # 실적 DB에서 7일 데이터 로드 (keyword → avg_cpc, impressions, clicks)
+    conn_r = sqlite3.connect(DB_PATH)
+    perf_rows = conn_r.execute(
+        "SELECT keyword, AVG(avg_cpc), SUM(impressions), SUM(clicks) "
+        "FROM cost_log WHERE log_date >= date('now','-7 days') GROUP BY keyword"
+    ).fetchall()
+    conn_r.close()
+    perf_db = {}
+    for row in perf_rows:
+        kw_n, avg_cpc_7d, imp_7d, clk_7d = row
+        perf_db[kw_n] = {
+            "avg_cpc_7d": int(avg_cpc_7d or 0),
+            "imp_7d":     int(imp_7d or 0),
+            "clk_7d":     int(clk_7d or 0),
+        }
+    log(f"  → 실적 DB: {len(perf_db)}개 키워드 데이터 로드")
+
     results = []
     total_daily_est = 0
 
@@ -247,10 +281,42 @@ def do_on_and_optimize():
         ag_id   = kw.get("_agId", "")
         cur_bid = kw.get("bidAmt", 70)
 
-        # keywordstool API 호출 제거 (크레딧 절약 핵심)
-        # 현재 입찰가를 기준으로 ±10% 범위에서 유지
-        ms, comp, depth = 500, "중간", 5.0  # 기본값 사용
-        new_bid, reason, changed = calc_smart_bid(kw_name, ms, comp, depth, cur_bid)
+        # 실적 DB 있으면 avg_cpc 기반으로 재최적화, 없으면 INIT_BIDS 폴백
+        perf = perf_db.get(kw_name)
+        if perf and perf["imp_7d"] >= 10:
+            # 실적 있음: avg_cpc 7일 평균 기반으로 입찰가 재최적화
+            base_cpc = perf["avg_cpc_7d"]
+            ctr_7d   = perf["clk_7d"] / perf["imp_7d"] * 100 if perf["imp_7d"] > 0 else 0
+            if base_cpc < MIN_BID:
+                new_bid = MIN_BID
+                reason  = f"실적CPC={base_cpc}원(저점)→MIN{MIN_BID}"
+            elif base_cpc <= 200:
+                if ctr_7d >= 3.0:
+                    new_bid = max(MIN_BID, round(base_cpc / 10) * 10)
+                    reason  = f"실적CPC={base_cpc},CTR={ctr_7d:.1f}%→유지"
+                else:
+                    raw     = max(MIN_BID, int(base_cpc * 0.90))
+                    new_bid = max(MIN_BID, round(raw / 10) * 10)
+                    reason  = f"실적CPC={base_cpc},CTR={ctr_7d:.1f}%→저CTR10%삭감"
+            else:
+                raw     = max(MIN_BID, int(base_cpc * 0.95))
+                new_bid = max(MIN_BID, round(raw / 10) * 10)
+                reason  = f"실적CPC={base_cpc}원→고CPC5%삭감"
+            changed  = new_bid != cur_bid
+            ms, comp, depth = 500, "중간", 5.0
+        else:
+            # 실적 없음: INIT_BIDS 폴백 → calc_smart_bid 호출
+            init     = INIT_BIDS.get(kw_name, {"ms": 500, "comp": "중간", "bid": 100})
+            ms, comp = init["ms"], init["comp"]
+            depth    = 5.0
+            new_bid, reason, changed = calc_smart_bid(kw_name, ms, comp, depth, cur_bid)
+            # INIT_BID가 현재와 다르고 변경 안된 경우 INIT_BID로 강제
+            if not changed and cur_bid != init["bid"]:
+                raw     = init["bid"]
+                new_bid = max(MIN_BID, min(MAX_BID, round(raw / 10) * 10))
+                changed = new_bid != cur_bid
+                reason  = f"INIT_BID={init['bid']}원(실적없음폴백)"
+
         daily_est = int(ms * 0.03 * new_bid / 30)
         total_daily_est += daily_est
 
@@ -261,7 +327,7 @@ def do_on_and_optimize():
             "changed": changed, "reason": reason,
             "daily_est": daily_est,
         })
-        log(f"  [{kw_name}] {cur_bid}→{new_bid}원 | {reason[:50]}")
+        log(f"  [{kw_name}] {cur_bid}→{new_bid}원 | {reason[:60]}")
 
     # ── 4. 일 예산 초과 시 전체 축소 ──────────────────────────────────
     log(f"── 4단계: 예산 체크 (예상 {total_daily_est:,}원 / 한도 {DAILY_BUDGET:,}원) ──")
