@@ -12,12 +12,12 @@ module.exports = {
     },
 
     // ── 2. 새벽 1시 광고 OFF ───────────────────────────────────────────
-    // cron: 매일 01:00 KST 실행
+    // KST 01:00 = UTC 16:00 (전날)
     {
       name: 'ad-off-01',
       script: 'python3',
       args: '/home/user/webapp/scheduler.py off',
-      cron_restart: '0 1 * * *',   // 매일 01:00 (서버 시각)
+      cron_restart: '0 16 * * *',   // UTC 16:00 = KST 01:00
       watch: false,
       autorestart: false,
       instances: 1,
@@ -27,12 +27,12 @@ module.exports = {
     },
 
     // ── 3. 아침 7시 광고 ON + 스마트 입찰 최적화 ─────────────────────
-    // cron: 매일 07:00 KST 실행
+    // KST 07:00 = UTC 22:00 (전날)
     {
       name: 'ad-on-07',
       script: 'python3',
       args: '/home/user/webapp/scheduler.py on',
-      cron_restart: '0 7 * * *',   // 매일 07:00 (서버 시각)
+      cron_restart: '0 22 * * *',   // UTC 22:00 = KST 07:00
       watch: false,
       autorestart: false,
       instances: 1,
