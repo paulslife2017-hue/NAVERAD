@@ -441,18 +441,138 @@ def do_on_and_optimize():
 # ══════════════════════════════════════════════════════════════════════════
 # 메인: 현재 시각 보고 해당 작업 실행
 # ══════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════
+# STEP D: 2시간 점검 (노출 확인 + 입찰가 실시간 조정)
+# ════════════════════════════════════════════════════════════════════════════
+def do_check():
+    """
+    2시간마다 실행 (운영시간 07~01시만)
+    - 키워드 조회 (API 2회 고정, 크레딧 최소)
+    - ELIGIBLE이지만 전날 imp=0 → 입찰가 15% 상향 (노출 안됨 판단)
+    - 입찰가가 INIT_BID보다 낙으면 → INIT_BID로 복원
+    - 일예산 80%가 넘으면 → 입찰가 10% 삭감 (비용 방어)
+    """
+    log("=" * 60)
+    log(f"▶ 2시간 점검 시작 (현재 {datetime.now().strftime('%H:%M')})")
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    from datetime import timedelta
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ── 1. 키워드 조회 (캐시 없이 실시간 조회) ──────────────────────────────
+    log("── 1단계: 키워드 실시간 조회 ──")
+    adgroups = api_get("/ncc/adgroups")
+    if not adgroups:
+        log("  ❌ 광고그룹 조회 실패 → 점검 중단")
+        return False
+
+    all_kws = []
+    for ag in adgroups:
+        kws = api_get("/ncc/keywords", {"nccAdgroupId": ag["nccAdgroupId"]})
+        if kws:
+            for kw in kws:
+                kw["_agId"] = ag["nccAdgroupId"]
+            all_kws.extend(kws)
+        time.sleep(0.2)
+    all_kws = [k for k in all_kws if k.get("keyword","") not in EXCLUDE_KEYWORDS]
+    log(f"  → 운영 키워드 {len(all_kws)}개 조회 완료")
+
+    # ── 2. 전날 stats 로드 (DB에서, API 조회 안 함 — 크레딧 0) ──────────────
+    log("── 2단계: 전날 실적 DB 로드 ──")
+    conn_r = sqlite3.connect(DB_PATH)
+    yesterday_rows = conn_r.execute(
+        "SELECT keyword, impressions, clicks, actual_cost FROM cost_log WHERE log_date=?",
+        (yesterday,)
+    ).fetchall()
+    conn_r.close()
+    yest_db = {row[0]: {"imp": row[1], "clk": row[2], "cost": row[3]} for row in yesterday_rows}
+    log(f"  → 전날({yesterday}) DB 데이터: {len(yest_db)}개 키워드")
+
+    # ── 3. 일예산 소진률 확인 ─────────────────────────────────────────────────
+    total_cost_yesterday = sum(v["cost"] for v in yest_db.values())
+    budget_pct = total_cost_yesterday / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
+    budget_over = budget_pct >= 80
+    log(f"  → 전날 전체비용={total_cost_yesterday:,}원 ({budget_pct:.0f}% / 일예산{DAILY_BUDGET:,}원) {'[⚠️80%초과]' if budget_over else '[OK]'}")
+
+    # ── 4. 키워드별 입찰가 조정 판단 ───────────────────────────────────
+    log("── 3단계: 입찰가 조정 판단 ──")
+    to_change = []
+
+    for kw in all_kws:
+        name    = kw.get("keyword","")
+        kw_id   = kw.get("nccKeywordId","")
+        ag_id   = kw.get("_agId","")
+        cur_bid = kw.get("bidAmt", 70)
+        status  = kw.get("status","")
+        init_bid = INIT_BIDS.get(name, {}).get("bid", 100)
+
+        if status != "ELIGIBLE":
+            log(f"  [{name}] status={status} → 스킵")
+            continue
+
+        yest = yest_db.get(name, {})
+        yest_imp = yest.get("imp", 0)
+
+        if budget_over:
+            # 일예산 80% 초과 → 입찰가 10% 삭감 (비용 방어)
+            raw     = max(MIN_BID, int(cur_bid * 0.90))
+            new_bid = max(MIN_BID, round(raw / 10) * 10)
+            reason  = f"일예산{budget_pct:.0f}%초과→입찰가10%삭감"
+        elif yest_imp == 0 and len(yest_db) > 0:
+            # 전날 데이터 있는데 imp=0 → 노출 안됨 판단 → 15% 상향
+            raw     = min(MAX_BID, int(cur_bid * 1.15))
+            new_bid = min(MAX_BID, round(raw / 10) * 10)
+            reason  = f"전날imp=0(노출없음)→입찰가15%상향"
+        elif cur_bid < init_bid:
+            # INIT_BID보다 낙으면 복원
+            new_bid = init_bid
+            reason  = f"입찰가({cur_bid})<INIT({init_bid})→복원"
+        else:
+            log(f"  [{name}] imp={yest_imp} bid={cur_bid}원 → 유지")
+            continue
+
+        if new_bid != cur_bid:
+            to_change.append({
+                "name": name, "kw_id": kw_id, "ag_id": ag_id,
+                "cur_bid": cur_bid, "new_bid": new_bid, "reason": reason
+            })
+
+    log(f"  → 변경 대상: {len(to_change)}개 / 유지: {len(all_kws)-len(to_change)}개")
+
+    # ── 5. PUT 적용 ───────────────────────────────────────────────────────────────═
+    ok = fail = 0
+    for r in to_change:
+        uri = f"/ncc/keywords/{r['kw_id']}"
+        sc, res = api_put(uri, {"nccAdgroupId": r["ag_id"], "useGroupBidAmt": False, "bidAmt": r["new_bid"]},
+                          "nccAdgroupId,useGroupBidAmt,bidAmt")
+        if sc == 200:
+            log(f"  ✅ [{r['name']}] {r['cur_bid']}→{r['new_bid']}원 | {r['reason']}")
+            ok += 1
+        else:
+            log(f"  ❌ [{r['name']}] 실패 [{sc}]")
+            fail += 1
+        db_log("CHECK", r["name"], sc==200, r["reason"])
+        time.sleep(0.2)
+
+    log(f"▶ 2시간 점검 완료: 변경 {ok}개 / 실패 {fail}개 / 유지 {len(all_kws)-len(to_change)}개")
+    return True
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 메인: 현재 시각 보고 해당 작업 실행
+# ════════════════════════════════════════════════════════════════════════════
 def main():
     init_db()
     now_h = datetime.now().hour
     arg   = sys.argv[1] if len(sys.argv) > 1 else None
 
-    # 강제 실행 인자 우선
     if arg == "off":
         do_off()
     elif arg == "on":
         do_on_and_optimize()
+    elif arg == "check":
+        do_check()
     elif arg == "test":
-        log("=== 테스트 모드: OFF → 3초 대기 → ON ===")
+        log("=== 테스트 모드: OFF → 3초 → ON ===")
         do_off()
         time.sleep(3)
         do_on_and_optimize()
@@ -464,8 +584,12 @@ def main():
         elif now_h == 7:
             log(f"현재 {now_h}시 → 광고 ON + 입찰 최적화 실행")
             do_on_and_optimize()
+        elif 7 <= now_h < 24 or now_h == 0:
+            # 07~24시: 2시간 점검 실행
+            log(f"현재 {now_h}시 → 2시간 점검 실행")
+            do_check()
         else:
-            log(f"현재 {now_h}시 → 스케줄 없음 (1시=OFF / 7시=ON+최적화)")
+            log(f"현재 {now_h}시 → 스케줄 없음 (1시=OFF / 7시=ON+최적화 / 8~24시=2h점검)")
 
 if __name__ == "__main__":
     main()
