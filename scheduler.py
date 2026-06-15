@@ -26,7 +26,25 @@ TARGET_CAMPAIGNS = [
 MONTHLY_BUDGET = 500_000
 DAILY_BUDGET   = 20000   # 2024-06-15 API 직접 변경 완료 (20,000원 고정)
 MIN_BID = 70
-MAX_BID = 1000
+MAX_BID = 1000  # 전체 기본 상한
+
+# 키워드별 개별 MAX_BID (검색량 낙은 키워드는 낙게 설정)
+KW_MAX_BID = {
+    "에어콘수리":          500,
+    "에어콘가스충전":      400,
+    "에어콘냉매충전":      380,
+    "에어콘가스":          350,
+    "삼성에어콘수리":      300,
+    "LG에어콘수리":        300,
+    "에어콘점검":          250,
+    "에어콘매립배관":        220,
+    "에어콘매립배관수리":    220,
+    "에어콘매립배관교체":    200,
+    "에어콘물떨어집":      180,
+}
+
+# 하루 상향 횟수 제한 (2회 초과 시 그날 더 이상 안 올림)
+CHECK_MAX_UP_PER_DAY = 2
 
 # ── 제외 키워드 (청소 계열 완전 제거) ──────────────────────────────────────
 EXCLUDE_KEYWORDS = {
@@ -86,6 +104,26 @@ def api_put(uri, body, fields=""):
     r   = requests.put(url, headers=_hdrs(ts, "PUT", uri),
                        json=body, timeout=15)
     return r.status_code, (r.json() if r.status_code == 200 else r.text[:200])
+
+# ── 대시보드 이력 기록 (Workers in-memory에 POST) ─────────────────────────
+DASHBOARD_URL = "http://localhost:3000"
+
+def push_history(keyword, old_bid, new_bid, reason):
+    """입찰가 변경 성공 시 대시보드 in-memory 이력에 기록 (실패해도 무시)"""
+    try:
+        requests.post(
+            f"{DASHBOARD_URL}/api/history-write",
+            json={
+                "keyword":   keyword,
+                "oldBid":    old_bid,
+                "newBid":    new_bid,
+                "reason":    reason,
+                "changedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            timeout=3,
+        )
+    except Exception:
+        pass  # 대시보드가 꺼져있어도 스케줄러 동작에 영향 없음
 
 # ── DB 초기화 ─────────────────────────────────────────────────────────────
 def init_db():
@@ -360,6 +398,7 @@ def do_on_and_optimize():
         if sc == 200:
             apply_ok += 1
             log(f"  ✅ {r['keyword']}: {r['old_bid']}→{r['new_bid']}원")
+            push_history(r["keyword"], r["old_bid"], r["new_bid"], r["reason"])
         else:
             apply_fail += 1
             log(f"  ❌ {r['keyword']}: 실패 [{sc}] {res}")
@@ -446,20 +485,21 @@ def do_on_and_optimize():
 # ════════════════════════════════════════════════════════════════════════════
 def do_check():
     """
-    2시간마다 실행 (운영시간 07~01시만)
-    - 키워드 조회 (API 2회 고정, 크레딧 최소)
-    - ELIGIBLE이지만 전날 imp=0 → 입찰가 15% 상향 (노출 안됨 판단)
-    - 입찰가가 INIT_BID보다 낙으면 → INIT_BID로 복원
-    - 일예산 80%가 넘으면 → 입찰가 10% 삭감 (비용 방어)
+    2시간마다 실행 (KST 09~23시)
+    크레딧: 키워드 조회 API 2회 + 캐페인 1회 (오늘소진확인)
+    로직:
+      ① 오늘 소진액 실시간 확인 (totalChargeCost) → 90% 초과시 전체 10% 삭감
+      ② CTR 저조 키워드 (전낡데이터 로드, 전낡 imp≥10 + CTR<1%) → 10% 삭감
+      ③ 전낡 imp=0 이고 오늘 상향 횟수 < 한도 → 15% 상향 (KW_MAX_BID 상한)
+      ④ 입찰가 < INIT_BID → INIT_BID 복원
     """
     log("=" * 60)
-    log(f"▶ 2시간 점검 시작 (현재 {datetime.now().strftime('%H:%M')})")
-    run_date = datetime.now().strftime("%Y-%m-%d")
+    log(f"▶ 2시간 점검 시작 ({datetime.now().strftime('%H:%M')})")
+    run_date  = datetime.now().strftime("%Y-%m-%d")
     from datetime import timedelta
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # ── 1. 키워드 조회 (캐시 없이 실시간 조회) ──────────────────────────────
-    log("── 1단계: 키워드 실시간 조회 ──")
+    # ── 1. 키워드 실시간 조회 ──────────────────────────────────────────────
     adgroups = api_get("/ncc/adgroups")
     if not adgroups:
         log("  ❌ 광고그룹 조회 실패 → 점검 중단")
@@ -469,86 +509,112 @@ def do_check():
     for ag in adgroups:
         kws = api_get("/ncc/keywords", {"nccAdgroupId": ag["nccAdgroupId"]})
         if kws:
-            for kw in kws:
-                kw["_agId"] = ag["nccAdgroupId"]
+            for kw in kws: kw["_agId"] = ag["nccAdgroupId"]
             all_kws.extend(kws)
         time.sleep(0.2)
     all_kws = [k for k in all_kws if k.get("keyword","") not in EXCLUDE_KEYWORDS]
-    log(f"  → 운영 키워드 {len(all_kws)}개 조회 완료")
+    log(f"  → 운영 키워드 {len(all_kws)}개 조회")
 
-    # ── 2. 전날 stats 로드 (DB에서, API 조회 안 함 — 크레딧 0) ──────────────
-    log("── 2단계: 전날 실적 DB 로드 ──")
+    # ── 2. 오늘 소진액 실시간 확인 (campaignAPI 1회) ──────────────────────
+    camp_data = api_get(f"/ncc/campaigns/{TARGET_CAMPAIGNS[0]}")
+    today_used = int((camp_data or {}).get("totalChargeCost", 0) or 0)
+    today_pct  = today_used / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
+    budget_critical = today_pct >= 90   # 90% 이상 → 전체 삭감
+    log(f"  → 오늘소진={today_used:,}원 ({today_pct:.0f}%) {'[⚠️90%초과!전체삭감]' if budget_critical else '[OK]'}")
+
+    # ── 3. 전낡 실적 DB 로드 ────────────────────────────────────────────────────
     conn_r = sqlite3.connect(DB_PATH)
-    yesterday_rows = conn_r.execute(
+    yest_rows = conn_r.execute(
         "SELECT keyword, impressions, clicks, actual_cost FROM cost_log WHERE log_date=?",
         (yesterday,)
     ).fetchall()
+    # 오늘 상향 횟수 카운트 (schedule_log CHECK 중 실제 상향된 것만)
+    up_counts = {}
+    for row in conn_r.execute(
+        "SELECT campaign, COUNT(*) FROM schedule_log "
+        "WHERE action='CHECK' AND success=1 AND detail LIKE '%상향%' "
+        "AND run_at >= ? GROUP BY campaign",
+        (run_date + " 00:00:00",)
+    ).fetchall():
+        up_counts[row[0]] = row[1]
     conn_r.close()
-    yest_db = {row[0]: {"imp": row[1], "clk": row[2], "cost": row[3]} for row in yesterday_rows}
-    log(f"  → 전날({yesterday}) DB 데이터: {len(yest_db)}개 키워드")
 
-    # ── 3. 일예산 소진률 확인 ─────────────────────────────────────────────────
-    total_cost_yesterday = sum(v["cost"] for v in yest_db.values())
-    budget_pct = total_cost_yesterday / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
-    budget_over = budget_pct >= 80
-    log(f"  → 전날 전체비용={total_cost_yesterday:,}원 ({budget_pct:.0f}% / 일예산{DAILY_BUDGET:,}원) {'[⚠️80%초과]' if budget_over else '[OK]'}")
+    yest_db = {r[0]: {"imp":r[1],"clk":r[2],"cost":r[3]} for r in yest_rows}
+    has_yest = len(yest_db) > 0
+    log(f"  → 전낡 DB: {len(yest_db)}개 | 오늘 상향횟수 키워드별: {dict(list(up_counts.items())[:3])}...")
 
-    # ── 4. 키워드별 입찰가 조정 판단 ───────────────────────────────────
-    log("── 3단계: 입찰가 조정 판단 ──")
+    # ── 4. 키워드별 판단 ───────────────────────────────────────────────────────────
     to_change = []
-
     for kw in all_kws:
-        name    = kw.get("keyword","")
-        kw_id   = kw.get("nccKeywordId","")
-        ag_id   = kw.get("_agId","")
-        cur_bid = kw.get("bidAmt", 70)
-        status  = kw.get("status","")
+        name     = kw.get("keyword","")
+        kw_id    = kw.get("nccKeywordId","")
+        ag_id    = kw.get("_agId","")
+        cur_bid  = kw.get("bidAmt", 70)
+        status   = kw.get("status","")
         init_bid = INIT_BIDS.get(name, {}).get("bid", 100)
+        kw_max   = KW_MAX_BID.get(name, MAX_BID)   # 키워드별 상한
 
         if status != "ELIGIBLE":
-            log(f"  [{name}] status={status} → 스킵")
+            log(f"  [{name}] {status} → 스킵")
             continue
 
-        yest = yest_db.get(name, {})
-        yest_imp = yest.get("imp", 0)
+        yest      = yest_db.get(name, {})
+        yest_imp  = yest.get("imp", 0)
+        yest_clk  = yest.get("clk", 0)
+        yest_ctr  = yest_clk / yest_imp * 100 if yest_imp > 0 else None
+        up_today  = up_counts.get(name, 0)   # 오늘 상향 횟수
 
-        if budget_over:
-            # 일예산 80% 초과 → 입찰가 10% 삭감 (비용 방어)
+        new_bid = cur_bid
+        reason  = ""
+
+        if budget_critical:
+            # ① 오늘 소진 90%초과 → 전체 10% 삭감
             raw     = max(MIN_BID, int(cur_bid * 0.90))
             new_bid = max(MIN_BID, round(raw / 10) * 10)
-            reason  = f"일예산{budget_pct:.0f}%초과→입찰가10%삭감"
-        elif yest_imp == 0 and len(yest_db) > 0:
-            # 전날 데이터 있는데 imp=0 → 노출 안됨 판단 → 15% 상향
-            raw     = min(MAX_BID, int(cur_bid * 1.15))
-            new_bid = min(MAX_BID, round(raw / 10) * 10)
-            reason  = f"전날imp=0(노출없음)→입찰가15%상향"
+            reason  = f"오늘소진{today_pct:.0f}%초과→삭감"
+        elif has_yest and yest_imp >= 10 and yest_ctr is not None and yest_ctr < 1.0:
+            # ② 전낡 imp≥10 이고 CTR<1% → 비용낙비 키워드 → 10% 삭감
+            raw     = max(MIN_BID, int(cur_bid * 0.90))
+            new_bid = max(MIN_BID, round(raw / 10) * 10)
+            reason  = f"전낡CTR={yest_ctr:.1f}%(<1%)→삭감"
+        elif (yest_imp == 0 and has_yest) and up_today < CHECK_MAX_UP_PER_DAY:
+            # ③ 전낡 imp=0 + 오늘 상향 2회 미만 → 15% 상향 (KW_MAX_BID 상한)
+            raw     = min(kw_max, int(cur_bid * 1.15))
+            new_bid = min(kw_max, round(raw / 10) * 10)
+            reason  = f"전낡imp=0+오늘{up_today}회상향→+15%(MAX:{kw_max})"
+        elif (yest_imp == 0 and has_yest) and up_today >= CHECK_MAX_UP_PER_DAY:
+            # 이미 상향한도된데 또 상향하려하는 경우 로그만
+            log(f"  [{name}] imp=0이지만 오늘 상향 {up_today}회 → 제한({CHECK_MAX_UP_PER_DAY}회) 도달, 유지")
+            continue
         elif cur_bid < init_bid:
-            # INIT_BID보다 낙으면 복원
-            new_bid = init_bid
+            # ④ INIT_BID보다 낙으면 복원
+            new_bid = min(kw_max, init_bid)
             reason  = f"입찰가({cur_bid})<INIT({init_bid})→복원"
         else:
-            log(f"  [{name}] imp={yest_imp} bid={cur_bid}원 → 유지")
+            log(f"  [{name}] imp={yest_imp} CTR={f'{yest_ctr:.1f}%' if yest_ctr is not None else '-'} bid={cur_bid}원 → 유지")
             continue
 
         if new_bid != cur_bid:
             to_change.append({
-                "name": name, "kw_id": kw_id, "ag_id": ag_id,
-                "cur_bid": cur_bid, "new_bid": new_bid, "reason": reason
+                "name":name, "kw_id":kw_id, "ag_id":ag_id,
+                "cur_bid":cur_bid, "new_bid":new_bid, "reason":reason
             })
 
-    log(f"  → 변경 대상: {len(to_change)}개 / 유지: {len(all_kws)-len(to_change)}개")
+    log(f"  → 변경 {len(to_change)}개 / 유지 {len(all_kws)-len(to_change)}개")
 
-    # ── 5. PUT 적용 ───────────────────────────────────────────────────────────────═
+    # ── 5. PUT 적용 ────────────────────────────────────────────────────────────────
     ok = fail = 0
     for r in to_change:
         uri = f"/ncc/keywords/{r['kw_id']}"
-        sc, res = api_put(uri, {"nccAdgroupId": r["ag_id"], "useGroupBidAmt": False, "bidAmt": r["new_bid"]},
+        sc, res = api_put(uri, {"nccAdgroupId":r["ag_id"],"useGroupBidAmt":False,"bidAmt":r["new_bid"]},
                           "nccAdgroupId,useGroupBidAmt,bidAmt")
+        tag = "↑" if r["new_bid"] > r["cur_bid"] else "↓"
         if sc == 200:
-            log(f"  ✅ [{r['name']}] {r['cur_bid']}→{r['new_bid']}원 | {r['reason']}")
+            log(f"  ✅ [{r['name']}] {r['cur_bid']}{tag}{r['new_bid']}원 | {r['reason']}")
+            push_history(r["name"], r["cur_bid"], r["new_bid"], r["reason"])
             ok += 1
         else:
-            log(f"  ❌ [{r['name']}] 실패 [{sc}]")
+            log(f"  ❌ [{r['name']}] 실패[{sc}]")
             fail += 1
         db_log("CHECK", r["name"], sc==200, r["reason"])
         time.sleep(0.2)

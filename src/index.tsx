@@ -16,6 +16,16 @@ const cache: Record<string, { data: unknown; ts: number }> = {}
 const TTL_1H  = 60 * 60 * 1000
 const TTL_12H = 12 * 60 * 60 * 1000
 
+// ── 입찰 변경 이력 (in-memory, Workers 재시작 전까지 유지) ─────────────────
+type BidHistoryEntry = {
+  keyword:   string
+  oldBid:    number
+  newBid:    number
+  reason:    string
+  changedAt: string  // ISO 8601
+}
+let bidChangeHistory: BidHistoryEntry[] = []
+
 // 청소 계열 — UI에 표시 안 함 (완전 제거)
 const EXCLUDE = new Set(['에어컨청소','삼성에어컨청소','벽걸이에어컨셀프청소','에어컨분해청소','에바크리닝','에어컨청소비용'])
 
@@ -194,6 +204,51 @@ app.post('/api/bid', async (c) => {
 app.delete('/api/cache', (c) => {
   Object.keys(cache).forEach(k => delete cache[k])
   return c.json({ ok:true })
+})
+
+// ── /api/history ─────────────────────────────────────────────────────────────
+// schedule_log(CHECK 이력) + bid_history(오늘 변경) → DB 조회 only, API 크레딧 0
+app.get('/api/history', async (c) => {
+  try {
+    // Cloudflare Workers 환경: D1 없으면 scheduler.py가 관리하는 SQLite는
+    // 런타임에 접근 불가 → 대신 scheduler.py가 기록한 bid_history를
+    // 네이버 API 키워드 현황과 합쳐서 반환
+    // ⚠️  Workers는 파일시스템 없음 → DB 파일 직접 읽기 불가
+    // → schedule_log / bid_history는 Python(scheduler.py)이 기록
+    // → 대시보드에서는 현재 키워드 입찰가만 알 수 있음
+    // → /api/history는 "오늘 변경된 키워드 입찰가 현황"만 반환
+    //
+    // 실질 해법: scheduler.py가 변경 사항을 KV나 별도 엔드포인트에 저장하거나,
+    //            Workers가 직접 SQLite를 읽을 수 없으므로
+    //            scheduler.py에서 변경할 때마다 /api/history-write 로 POST하도록 함
+    //
+    // 현재 세션: in-memory 이력 저장 (Workers 재시작 전까지 유지)
+    return c.json({ ok: true, history: bidChangeHistory, updatedAt: new Date().toISOString() })
+  } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
+})
+
+// ── /api/history-write ────────────────────────────────────────────────────────
+// scheduler.py가 입찰가 변경 시 호출 → in-memory 이력 저장
+app.post('/api/history-write', async (c) => {
+  try {
+    const body = await c.req.json() as {
+      keyword: string; oldBid: number; newBid: number; reason: string; changedAt: string
+    }
+    const entry: BidHistoryEntry = {
+      keyword:   body.keyword,
+      oldBid:    body.oldBid,
+      newBid:    body.newBid,
+      reason:    body.reason,
+      changedAt: body.changedAt || new Date().toISOString(),
+    }
+    // 오늘 날짜 기준 필터 (KST 기준 당일 것만 유지)
+    const today = new Date().toISOString().slice(0, 10)
+    bidChangeHistory = [
+      ...bidChangeHistory.filter(h => h.changedAt.slice(0, 10) === today),
+      entry,
+    ].slice(-50) // 최대 50건
+    return c.json({ ok: true })
+  } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
 
 app.get('/', (c) => c.html(PAGE))
@@ -466,6 +521,36 @@ body{background:#0a0d14;color:#e2e8f0;min-height:100vh}
         </div>
       </div>
 
+      <!-- 입찰 변경 이력 패널 -->
+      <div class="card" style="padding:16px 20px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+          <div style="font-size:11px;color:#4a5568;font-weight:600">
+            <i class="fas fa-history" style="color:#f6ad55;margin-right:4px"></i>오늘 입찰 변경 이력
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span id="hist-count-badge" style="font-size:10px;color:#334155;background:#0d1020;border:1px solid #1e2a3a;padding:1px 8px;border-radius:10px">0건</span>
+            <button onclick="loadHistory()" title="이력 새로고침"
+              style="background:none;border:none;color:#334155;cursor:pointer;font-size:11px;padding:2px 4px">
+              <i class="fas fa-sync-alt" id="hist-refresh-icon"></i>
+            </button>
+          </div>
+        </div>
+        <!-- 이력 목록 -->
+        <div id="hist-list" style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto">
+          <div style="text-align:center;color:#1e2a3a;font-size:11px;padding:16px 0">
+            <i class="fas fa-spinner fa-spin"></i>
+          </div>
+        </div>
+        <!-- 오늘 요약 바 -->
+        <div id="hist-summary" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid #1a2235">
+          <div style="display:flex;justify-content:space-between;font-size:11px">
+            <span style="color:#4a5568">상향 <span id="hist-up-cnt" style="color:#03C75A;font-weight:700">0</span>회</span>
+            <span style="color:#4a5568">하향 <span id="hist-dn-cnt" style="color:#fc8181;font-weight:700">0</span>회</span>
+            <span style="color:#4a5568">복원 <span id="hist-rs-cnt" style="color:#f6ad55;font-weight:700">0</span>회</span>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 </main>
@@ -475,8 +560,10 @@ let D = null
 
 document.addEventListener('DOMContentLoaded', () => {
   loadData()
+  loadHistory()
   updateNextRun()
   setInterval(updateNextRun, 60000)
+  setInterval(loadHistory, 5 * 60 * 1000)  // 5분마다 이력 자동 갱신
   renderRegionChips()
 })
 
@@ -663,6 +750,102 @@ async function applyBid() {
       await loadData()
     } else toast('실패: ' + d.error, 'err')
   } catch(e) { toast('오류: ' + e.message, 'err') }
+}
+
+// ── 입찰 변경 이력 ──────────────────────────────────────────────────────────
+async function loadHistory() {
+  const icon = document.getElementById('hist-refresh-icon')
+  icon.classList.add('spin')
+  try {
+    const r = await fetch('/api/history')
+    const d = await r.json()
+    if (d.ok) renderHistory(d.history || [])
+    else renderHistoryEmpty('API 오류: ' + d.error)
+  } catch(e) {
+    renderHistoryEmpty('불러오기 실패')
+  } finally {
+    icon.classList.remove('spin')
+  }
+}
+
+function renderHistory(hist) {
+  const list  = document.getElementById('hist-list')
+  const badge = document.getElementById('hist-count-badge')
+  const sumDiv= document.getElementById('hist-summary')
+
+  badge.textContent = hist.length + '건'
+
+  if (!hist.length) {
+    list.innerHTML = '<div style="text-align:center;color:#1e3040;font-size:11px;padding:16px 0">' +
+      '<i class="fas fa-check-circle" style="color:#1a3a2a;margin-right:4px"></i>오늘 변경 없음</div>'
+    sumDiv.style.display = 'none'
+    return
+  }
+
+  // 최신순 정렬
+  const sorted = [...hist].sort((a,b) => b.changedAt.localeCompare(a.changedAt))
+
+  let upCnt = 0, dnCnt = 0, rsCnt = 0
+  list.innerHTML = sorted.map(h => {
+    const diff  = h.newBid - h.oldBid
+    const isUp  = diff > 0
+    const isRst = h.reason && h.reason.includes('복원')
+
+    if (isRst)       rsCnt++
+    else if (isUp)   upCnt++
+    else             dnCnt++
+
+    const arrow = isRst
+      ? '<span style="color:#f6ad55">↺</span>'
+      : isUp
+        ? '<span style="color:#03C75A">▲</span>'
+        : '<span style="color:#fc8181">▼</span>'
+
+    const diffTxt = isRst
+      ? '<span style="color:#f6ad55;font-weight:700">복원</span>'
+      : isUp
+        ? '<span style="color:#03C75A;font-weight:700">+' + diff + '원</span>'
+        : '<span style="color:#fc8181;font-weight:700">' + diff + '원</span>'
+
+    // 시각 표시 (KST — changedAt은 ISO or 'YYYY-MM-DD HH:MM:SS')
+    let timeTxt = ''
+    try {
+      const dt = new Date(h.changedAt.replace(' ','T'))
+      timeTxt = dt.toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'})
+    } catch(_) { timeTxt = h.changedAt.slice(11,16) }
+
+    // 이유 축약 (길면 잘라서 표시)
+    const reason = h.reason ? h.reason.replace(/→입찰가/g,'').replace(/\(.*?\)/g,'').trim() : ''
+    const reasonShort = reason.length > 20 ? reason.slice(0,20) + '…' : reason
+
+    return '<div style="background:#0d1020;border:1px solid #1a2235;border-radius:8px;padding:8px 10px">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:3px">' +
+        '<span style="font-size:12px;font-weight:600;color:#e2e8f0">' + arrow + ' ' + h.keyword + '</span>' +
+        '<span style="font-size:10px;color:#334155">' + timeTxt + '</span>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;justify-content:space-between">' +
+        '<span style="font-size:11px;color:#4a5568">' +
+          h.oldBid.toLocaleString() + '원 → ' +
+          '<span style="color:#94a3b8;font-weight:600">' + h.newBid.toLocaleString() + '원</span>' +
+          ' (' + diffTxt + ')' +
+        '</span>' +
+      '</div>' +
+      (reasonShort ? '<div style="font-size:10px;color:#334155;margin-top:2px">' + reasonShort + '</div>' : '') +
+    '</div>'
+  }).join('')
+
+  // 요약 바
+  sumDiv.style.display = 'block'
+  document.getElementById('hist-up-cnt').textContent = String(upCnt)
+  document.getElementById('hist-dn-cnt').textContent = String(dnCnt)
+  document.getElementById('hist-rs-cnt').textContent = String(rsCnt)
+}
+
+function renderHistoryEmpty(msg) {
+  document.getElementById('hist-list').innerHTML =
+    '<div style="text-align:center;color:#334155;font-size:11px;padding:14px 0">' + msg + '</div>'
+  document.getElementById('hist-count-badge').textContent = '0건'
+  document.getElementById('hist-summary').style.display = 'none'
 }
 
 function renderRegionChips() {
