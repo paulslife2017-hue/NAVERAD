@@ -147,8 +147,8 @@ app.get('/api/data', async (c) => {
     const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
     const isOn = mainCamp && !mainCamp.userLock && mainCamp.status === 'ELIGIBLE'
 
-    // 예산 계산
-    const dailyBudget    = mainCamp?.dailyBudget || 0
+    // 예산 계산 — 일예산은 20,000원 고정 (API값 무시, 직접 변경 완료)
+    const dailyBudget    = 20000
     const totalUsedMonth = keywords.reduce((s: number, k: any) => s + k.costMonth, 0)
     const totalUsed30    = keywords.reduce((s: number, k: any) => s + k.cost, 0)
     // 오늘 소진 추정: stats는 전날까지만 정확 → totalChargeCost 사용
@@ -367,9 +367,8 @@ body{background:#0a0d14;color:#e2e8f0;min-height:100vh}
             <i class="fas fa-info-circle"></i> 아직 실적 데이터 없음
           </div>
           <div style="color:#4a5568;font-size:12px;line-height:1.7">
-            광고가 <strong style="color:#fc8181">PAUSED</strong> 상태라 노출·클릭·비용 데이터가 없습니다.<br>
-            7시 광고 ON 이후 데이터가 쌓이면 자동 반영됩니다.
-            <span style="color:#1e3a4a">&nbsp;(stats 12시간 캐시)</span>
+            광고 ON 상태입니다. 오늘 집행 데이터는 내일 아침 7시 이후 표시됩니다.<br>
+            <span style="color:#1e3a4a">&nbsp;(stats 12시간 캐시 · 전일 기준)</span>
           </div>
         </div>
 
@@ -554,7 +553,7 @@ function renderKPI() {
   document.getElementById('k-status').textContent      = isOn ? '광고 ON' : '광고 OFF'
   document.getElementById('k-status').style.color      = isOn ? '#03C75A' : '#fc8181'
   document.getElementById('k-budget-label').textContent= D.camp
-    ? '일예산 ' + (D.camp.dailyBudget||0).toLocaleString() + '원'
+    ? '일예산 20,000원'
     : '—'
 
   document.getElementById('k-active').textContent      = kws.length + '개'
