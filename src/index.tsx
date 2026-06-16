@@ -109,7 +109,13 @@ app.get('/api/data', async (c) => {
       )
     )
     const allKw: any[] = (kwBatch as any[][]).flat()
-    const activeKw = allKw.filter((k: any) => !EXCLUDE.has(k.keyword))
+    // 같은 키워드명이 여러 그룹에 있을 경우 높은 입찰가 기준으로 중복 제거
+    const kwMap: Record<string, any> = {}
+    for (const k of allKw) {
+      const existing = kwMap[k.keyword]
+      if (!existing || k.bidAmt > existing.bidAmt) kwMap[k.keyword] = k
+    }
+    const activeKw = Object.values(kwMap).filter((k: any) => !EXCLUDE.has(k.keyword))
     const ids = activeKw.map((k: any) => k.nccKeywordId)
 
     // stats 2종 병렬 (캐시 키 분리, 각각 12h)
