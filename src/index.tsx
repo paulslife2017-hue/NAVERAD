@@ -10,11 +10,14 @@ const SK  = 'AQAAAADoqeXHGe8uqDGMNwaGyV8ub0ko3GK/zB5aWTFEsaWJMw=='
 const CID = '4412351'
 const API = 'https://api.naver.com'
 
-// ── 캐시 — stats는 1h로 단축 (실시간성 향상) ────────────────────────────────
+// ── 캐시 — 크레딧 절약 최우선 ──────────────────────────────────────────────
 const cache: Record<string, { data: unknown; ts: number }> = {}
-const TTL_1H  = 60 * 60 * 1000
-const TTL_12H = 12 * 60 * 60 * 1000   // 키워드 목록용 (변경 빈도 낮음)
-const TTL_STATS = 60 * 60 * 1000      // stats: 1h (이전 12h → 단축)
+const TTL_1H    = 60 * 60 * 1000
+const TTL_12H   = 12 * 60 * 60 * 1000  // 키워드 목록/캠페인 (잘 안바뀜)
+const TTL_3H    =  3 * 60 * 60 * 1000  // 30일·이번달 stats (자주 볼 필요 없음)
+const TTL_2H    =  2 * 60 * 60 * 1000  // 어제 실적 (집계 완료 후 고정)
+const TTL_6H    =  6 * 60 * 60 * 1000  // 7일 트렌드 (어제까지 데이터, 거의 안바뀜)
+const TTL_STATS = TTL_2H               // 어제 단건 기본값
 
 // ── 입찰 변경 이력 (in-memory) ─────────────────────────────────────────
 type BidHistoryEntry = {
@@ -137,10 +140,10 @@ app.get('/api/data', async (c) => {
     const activeKw = Object.values(kwMap).filter((k: any) => !EXCLUDE.has(k.keyword))
     const ids = activeKw.map((k: any) => k.nccKeywordId)
 
-    // stats: TOTAL 단위로 조회 (date:"?" 문제 회피)
+    // stats: TOTAL 단위로 조회 (date:"?" 문제 회피) — TTL 3h (크레딧 절약)
     const [statsRaw30, statsRawMonth] = await Promise.all([
-      nStatsKw(ids, since30,    today, '__stats30__',    TTL_STATS) as Promise<any[]>,
-      nStatsKw(ids, monthStart, today, '__statsMonth__', TTL_STATS) as Promise<any[]>,
+      nStatsKw(ids, since30,    today, '__stats30__',    TTL_3H) as Promise<any[]>,
+      nStatsKw(ids, monthStart, today, '__statsMonth__', TTL_3H) as Promise<any[]>,
     ])
 
     function sumStats(rows: any[]) {
@@ -247,18 +250,18 @@ app.get('/api/yesterday', async (c) => {
       return { imp, clk, cost }
     }
 
-    // 어제 조회
-    const rawYest = await nStatsDay(agIds, yestStr, yestStr, `__yest_${yestStr}__`, TTL_STATS) as any[]
+    // 어제 조회 — TTL 2h
+    const rawYest = await nStatsDay(agIds, yestStr, yestStr, `__yest_${yestStr}__`, TTL_2H) as any[]
     const { imp: yImp, clk: yClk, cost: yCost } = parseStatRows(rawYest)
     const yCtr  = yImp > 0 ? +(yClk / yImp * 100).toFixed(2) : 0
     const yCpc  = yClk > 0 ? Math.round(yCost / yClk) : 0
 
-    // 7일 트렌드: 날짜별 개별 조회 (date 필드 없는 문제 우회)
+    // 7일 트렌드: 날짜별 개별 조회 — TTL 6h (어제까지 데이터라 자주 안바뀜)
     const trend7: { date:string; imp:number; clk:number; cost:number }[] = []
     const dayRaws = await Promise.all(
       Array.from({ length: 7 }, (_, i) => {
         const d = new Date(kstNow.getTime() - (7 - i) * 86400000).toISOString().slice(0,10)
-        return nStatsDay(agIds, d, d, `__day_${d}__`, TTL_STATS).then((rows: any) => ({ date: d, rows: rows as any[] }))
+        return nStatsDay(agIds, d, d, `__day_${d}__`, TTL_6H).then((rows: any) => ({ date: d, rows: rows as any[] }))
       })
     )
     for (const { date, rows } of dayRaws) {
@@ -292,10 +295,31 @@ app.post('/api/bid', async (c) => {
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
 
+// /api/cache?type=ncc  → 입찰가·키워드·캠페인 캐시만 삭제 (새로고침용)
+// /api/cache?type=stats → stats 캐시만 삭제 (실적 강제갱신용)
+// /api/cache            → 전체 삭제
 app.delete('/api/cache', (c) => {
-  const cnt = Object.keys(cache).length
-  Object.keys(cache).forEach(k => delete cache[k])
-  return c.json({ ok:true, cleared: cnt })
+  const type = c.req.query('type')
+  let cnt = 0
+  if (type === 'ncc') {
+    // 입찰가·키워드·캠페인만 — stats는 건드리지 않음 (크레딧 절약)
+    Object.keys(cache).forEach(k => {
+      if (k.includes('/ncc/') || k.includes('/campaigns') || k.includes('/adgroups')) {
+        delete cache[k]; cnt++
+      }
+    })
+  } else if (type === 'stats') {
+    // stats만 — 입찰가는 그대로
+    Object.keys(cache).forEach(k => {
+      if (!k.includes('/ncc/') && !k.includes('/campaigns') && !k.includes('/adgroups')) {
+        delete cache[k]; cnt++
+      }
+    })
+  } else {
+    cnt = Object.keys(cache).length
+    Object.keys(cache).forEach(k => delete cache[k])
+  }
+  return c.json({ ok:true, cleared: cnt, type: type || 'all' })
 })
 
 app.get('/api/history', async (c) => {
@@ -625,8 +649,8 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
             <i class="fas fa-clock" style="margin-right:5px"></i>아직 실적 데이터 없음
           </div>
           <div style="font-size:11px;color:#b45309;line-height:1.6">
-            광고 ON 상태입니다. 오늘 집행 데이터는 내일 아침 7시 이후 표시됩니다.<br>
-            stats API는 전일 기준 · 12시간 캐시로 운영됩니다.
+            광고 ON 상태입니다. 오늘 집행 데이터는 내일 이후 표시됩니다.<br>
+            실적은 전일 기준 · 2~6h 캐시. 상단 "실적 새로고침"으로 강제 갱신 가능.
           </div>
         </div>
         <div class="tbl-wrap">
@@ -773,15 +797,14 @@ async function init() {
 async function hardRefresh() {
   const ic = document.getElementById('ri')
   ic.classList.add('fa-spin')
-  await fetch('/api/cache', { method:'DELETE' })
+  // ncc만 클리어: 입찰가·키워드·캠페인 새로고침 (크레딧 절약 — stats는 건드리지 않음)
+  await fetch('/api/cache?type=ncc', { method:'DELETE' })
   const r = await fetch('/api/data')
   D = await r.json()
   render()
   loadHistory()
-  // 새로고침 시 어제 실적도 갱신
-  await loadYesterday()
   ic.classList.remove('fa-spin')
-  toast('데이터를 새로 불러왔습니다.', 'ok')
+  toast('입찰가·상태를 새로 불러옴. 실적은 ' + (D.statsTtlMin||60) + '분 캐시 유지', 'ok')
 }
 
 // ────────────────────────── 어제 실적 로드 ──────────────────────────
@@ -801,12 +824,12 @@ async function refreshYest() {
   const btn = document.getElementById('yest-refresh-btn')
   ic.classList.add('fa-spin')
   btn.disabled = true
-  // stats 캐시만 선택적으로 클리어 (전체 캐시 삭제보다 가볍게)
-  await fetch('/api/cache', { method:'DELETE' })
+  // stats 캐시만 클리어 — 입찰가는 그대로
+  await fetch('/api/cache?type=stats', { method:'DELETE' })
   await loadYesterday()
   ic.classList.remove('fa-spin')
   btn.disabled = false
-  toast('어제 실적을 새로 불러왔습니다.', 'ok')
+  toast('어제 실적 강제 갱신 완료', 'ok')
 }
 
 function renderYesterday() {
