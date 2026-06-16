@@ -577,17 +577,19 @@ def do_check():
             raw     = max(MIN_BID, int(cur_bid * 0.90))
             new_bid = max(MIN_BID, round(raw / 10) * 10)
             reason  = f"전낡CTR={yest_ctr:.1f}%(<1%)→삭감"
-        elif (yest_imp == 0 and has_yest) and up_today < CHECK_MAX_UP_PER_DAY:
-            # ③ 전낡 imp=0 + 오늘 상향 2회 미만 → 15% 상향 (KW_MAX_BID 상한)
+        elif yest_imp == 0 and up_today < CHECK_MAX_UP_PER_DAY:
+            # ③ 전날 imp=0 (DB 없어도 포함) + 오늘 상향 2회 미만 → 15% 상향
             raw     = min(kw_max, int(cur_bid * 1.15))
-            new_bid = min(kw_max, round(raw / 10) * 10)
-            reason  = f"전낡imp=0+오늘{up_today}회상향→+15%(MAX:{kw_max})"
-        elif (yest_imp == 0 and has_yest) and up_today >= CHECK_MAX_UP_PER_DAY:
-            # 이미 상향한도된데 또 상향하려하는 경우 로그만
-            log(f"  [{name}] imp=0이지만 오늘 상향 {up_today}회 → 제한({CHECK_MAX_UP_PER_DAY}회) 도달, 유지")
+            new_bid = min(kw_max, max(MIN_BID, round(raw / 10) * 10))
+            if new_bid == cur_bid:  # 반올림 후 동일하면 최소 10원 올림
+                new_bid = min(kw_max, cur_bid + 10)
+            reason  = f"노출없음({('DB없음' if not has_yest else '전날0')})+오늘{up_today}회→+15%(MAX:{kw_max})"
+        elif yest_imp == 0 and up_today >= CHECK_MAX_UP_PER_DAY:
+            # 상향 횟수 한도 도달
+            log(f"  [{name}] 노출없음이지만 오늘 {up_today}회 상향 완료 → 유지")
             continue
         elif cur_bid < init_bid:
-            # ④ INIT_BID보다 낙으면 복원
+            # ④ INIT_BID보다 낮으면 복원
             new_bid = min(kw_max, init_bid)
             reason  = f"입찰가({cur_bid})<INIT({init_bid})→복원"
         else:
