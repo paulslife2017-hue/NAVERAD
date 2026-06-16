@@ -157,8 +157,8 @@ app.get('/api/data', async (c) => {
     const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
     const isOn = mainCamp && !mainCamp.userLock && mainCamp.status === 'ELIGIBLE'
 
-    // 예산 계산 — 일예산은 20,000원 고정 (API값 무시, 직접 변경 완료)
-    const dailyBudget    = 20000
+    // 예산 계산 — 일예산은 API값 그대로 사용
+    const dailyBudget    = Number(mainCamp?.dailyBudget || 50000)
     const totalUsedMonth = keywords.reduce((s: number, k: any) => s + k.costMonth, 0)
     const totalUsed30    = keywords.reduce((s: number, k: any) => s + k.cost, 0)
     // 오늘 소진 추정: stats는 전날까지만 정확 → totalChargeCost 사용
@@ -640,7 +640,7 @@ function renderKPI() {
   document.getElementById('k-status').textContent      = isOn ? '광고 ON' : '광고 OFF'
   document.getElementById('k-status').style.color      = isOn ? '#03C75A' : '#fc8181'
   document.getElementById('k-budget-label').textContent= D.camp
-    ? '일예산 20,000원'
+    ? '일예산 ' + (D.budget?.daily || 50000).toLocaleString() + '원'
     : '—'
 
   document.getElementById('k-active').textContent      = kws.length + '개'
