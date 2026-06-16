@@ -567,31 +567,56 @@ def do_check():
         new_bid = cur_bid
         reason  = ""
 
+        # ── 스윗스팟 탐색 로직 ─────────────────────────────────────────────
+        # 목표: 노출은 되면서 비용은 최소인 입찰가 찾기
+        #   노출 있음 + CTR 양호(≥1%) → -8% 낮춰보기 (스윗스팟 탐색 하강)
+        #   노출 있음 + CTR 저조(<1%) → -10% (광고 품질 낮음, 비용 낭비)
+        #   노출 없음                  → +15% 상향 (노출 시작점 탐색 상승)
+        #   노출 없음 + 상향 한도      → 유지
+        #   예산 90% 초과             → 전체 -10% (비상 제동)
+
         if budget_critical:
-            # ① 오늘 소진 90%초과 → 전체 10% 삭감
+            # ① 예산 90% 초과 → 비상 제동 -10%
             raw     = max(MIN_BID, int(cur_bid * 0.90))
             new_bid = max(MIN_BID, round(raw / 10) * 10)
-            reason  = f"오늘소진{today_pct:.0f}%초과→삭감"
-        elif has_yest and yest_imp >= 10 and yest_ctr is not None and yest_ctr < 1.0:
-            # ② 전낡 imp≥10 이고 CTR<1% → 비용낙비 키워드 → 10% 삭감
+            reason  = f"예산{today_pct:.0f}%초과→비상제동-10%"
+
+        elif has_yest and yest_imp >= 5 and yest_ctr is not None and yest_ctr >= 1.0:
+            # ② 노출 있고 CTR 양호 → 스윗스팟 탐색: -8% 낮춰보기
+            raw     = max(init_bid, int(cur_bid * 0.92))
+            new_bid = max(init_bid, round(raw / 10) * 10)
+            if new_bid == cur_bid:
+                new_bid = max(init_bid, cur_bid - 10)
+            if new_bid < cur_bid:
+                reason = f"노출{yest_imp}CTR{yest_ctr:.1f}%양호→스윗스팟탐색-8%"
+            else:
+                log(f"  [{name}] 이미 INIT_BID 최저({init_bid}원) → 유지")
+                continue
+
+        elif has_yest and yest_imp >= 5 and yest_ctr is not None and yest_ctr < 1.0:
+            # ③ 노출 있으나 CTR 저조(<1%) → 품질 낮음, -10%
             raw     = max(MIN_BID, int(cur_bid * 0.90))
             new_bid = max(MIN_BID, round(raw / 10) * 10)
-            reason  = f"전낡CTR={yest_ctr:.1f}%(<1%)→삭감"
+            reason  = f"노출있음CTR{yest_ctr:.1f}%저조→-10%"
+
         elif yest_imp == 0 and up_today < CHECK_MAX_UP_PER_DAY:
-            # ③ 전날 imp=0 (DB 없어도 포함) + 오늘 상향 2회 미만 → 15% 상향
+            # ④ 노출 없음 → +15% 상향 탐색
             raw     = min(kw_max, int(cur_bid * 1.15))
             new_bid = min(kw_max, max(MIN_BID, round(raw / 10) * 10))
-            if new_bid == cur_bid:  # 반올림 후 동일하면 최소 10원 올림
+            if new_bid == cur_bid:
                 new_bid = min(kw_max, cur_bid + 10)
-            reason  = f"노출없음({('DB없음' if not has_yest else '전날0')})+오늘{up_today}회→+15%(MAX:{kw_max})"
+            reason  = f"노출없음({('DB없음' if not has_yest else '전날0')})+{up_today}회→+15%"
+
         elif yest_imp == 0 and up_today >= CHECK_MAX_UP_PER_DAY:
-            # 상향 횟수 한도 도달
-            log(f"  [{name}] 노출없음이지만 오늘 {up_today}회 상향 완료 → 유지")
+            # 상향 한도 도달
+            log(f"  [{name}] 노출없음+오늘{up_today}회상향한도→유지")
             continue
+
         elif cur_bid < init_bid:
-            # ④ INIT_BID보다 낮으면 복원
+            # ⑤ INIT_BID 아래로 내려가면 복원
             new_bid = min(kw_max, init_bid)
             reason  = f"입찰가({cur_bid})<INIT({init_bid})→복원"
+
         else:
             log(f"  [{name}] imp={yest_imp} CTR={f'{yest_ctr:.1f}%' if yest_ctr is not None else '-'} bid={cur_bid}원 → 유지")
             continue
