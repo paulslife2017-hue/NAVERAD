@@ -664,14 +664,28 @@ def do_check():
 def main():
     init_db()
     now_h = datetime.now().hour
+    now_m = datetime.now().minute
     arg   = sys.argv[1] if len(sys.argv) > 1 else None
 
     if arg == "off":
-        do_off()
+        # PM2 cron_restart 오작동 방지: KST 01시(UTC 16시)에만 실행
+        # PM2 재시작 시 즉시 실행되므로, 정해진 시각이 아니면 스킵
+        if now_h == 1:
+            do_off()
+        else:
+            log(f"[SKIP] off 명령이지만 현재 {now_h}시 (KST 01시에만 실행) → 스킵")
     elif arg == "on":
-        do_on_and_optimize()
+        # KST 07시에만 실행
+        if now_h == 7:
+            do_on_and_optimize()
+        else:
+            log(f"[SKIP] on 명령이지만 현재 {now_h}시 (KST 07시에만 실행) → 스킵")
     elif arg == "check":
-        do_check()
+        # KST 09~23시에만 실행 (07시 ON 이후, 01시 OFF 이전)
+        if 9 <= now_h <= 23:
+            do_check()
+        else:
+            log(f"[SKIP] check 명령이지만 현재 {now_h}시 (KST 09~23시에만 실행) → 스킵")
     elif arg == "test":
         log("=== 테스트 모드: OFF → 3초 → ON ===")
         do_off()
