@@ -10,10 +10,11 @@ const SK  = 'AQAAAADoqeXHGe8uqDGMNwaGyV8ub0ko3GK/zB5aWTFEsaWJMw=='
 const CID = '4412351'
 const API = 'https://api.naver.com'
 
-// ── 캐시 — 크레딧 최대 절약 ──────────────────────────────────────────────────
+// ── 캐시 — stats는 1h로 단축 (실시간성 향상) ────────────────────────────────
 const cache: Record<string, { data: unknown; ts: number }> = {}
 const TTL_1H  = 60 * 60 * 1000
-const TTL_12H = 12 * 60 * 60 * 1000
+const TTL_12H = 12 * 60 * 60 * 1000   // 키워드 목록용 (변경 빈도 낮음)
+const TTL_STATS = 60 * 60 * 1000      // stats: 1h (이전 12h → 단축)
 
 // ── 입찰 변경 이력 (in-memory) ─────────────────────────────────────────
 type BidHistoryEntry = {
@@ -64,21 +65,46 @@ async function nPut(uri: string, body: unknown) {
   return res.json()
 }
 
-async function nStats(ids: string[], since: string, until: string, ckey: string, ttl = TTL_12H) {
+// nStatsKw: 키워드 ID 기준 집계 (timeUnit=TOTAL, 기간 합산용)
+async function nStatsKw(ids: string[], since: string, until: string, ckey: string, ttl = TTL_STATS) {
   if (!ids.length) return []
   if (cache[ckey] && Date.now() - cache[ckey].ts < ttl) return cache[ckey].data
   const uri = '/stats'
+  // TOTAL 단위로 조회 → date:"?" 문제 없음, 기간 합산값 반환
   const params = new URLSearchParams({
     ids: ids.join(','),
     fields: '["impCnt","clkCnt","salesAmt","ctr","cpc"]',
     timeRange: JSON.stringify({ since, until }),
-    timeUnit: 'DAY',
+    timeUnit: 'TOTAL',
   })
   const ts = String(Date.now())
   const res = await fetch(`${API}${uri}?${params}`, {
     headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'GET',uri) }
   })
   if (!res.ok) throw new Error(`stats → ${res.status}`)
+  const d: any = await res.json()
+  const data = d.data || []
+  cache[ckey] = { data, ts: Date.now() }
+  return data
+}
+
+// nStatsDay: 광고그룹 ID 기준 DAY 단위 조회 (날짜별 트렌드용)
+async function nStatsDay(agIds: string[], since: string, until: string, ckey: string, ttl = TTL_STATS) {
+  if (!agIds.length) return []
+  if (cache[ckey] && Date.now() - cache[ckey].ts < ttl) return cache[ckey].data
+  const uri = '/stats'
+  const params = new URLSearchParams({
+    ids: agIds.join(','),
+    fields: '["impCnt","clkCnt","salesAmt"]',
+    timeRange: JSON.stringify({ since, until }),
+    timeUnit: 'DAY',
+    // 광고그룹 ID로 조회 시 date가 정상 반환됨
+  })
+  const ts = String(Date.now())
+  const res = await fetch(`${API}${uri}?${params}`, {
+    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'GET',uri) }
+  })
+  if (!res.ok) throw new Error(`statsDay → ${res.status}`)
   const d: any = await res.json()
   const data = d.data || []
   cache[ckey] = { data, ts: Date.now() }
@@ -111,16 +137,20 @@ app.get('/api/data', async (c) => {
     const activeKw = Object.values(kwMap).filter((k: any) => !EXCLUDE.has(k.keyword))
     const ids = activeKw.map((k: any) => k.nccKeywordId)
 
+    // stats: TOTAL 단위로 조회 (date:"?" 문제 회피)
     const [statsRaw30, statsRawMonth] = await Promise.all([
-      nStats(ids, since30,    today, '__stats30__',    TTL_12H) as Promise<any[]>,
-      nStats(ids, monthStart, today, '__statsMonth__', TTL_12H) as Promise<any[]>,
+      nStatsKw(ids, since30,    today, '__stats30__',    TTL_STATS) as Promise<any[]>,
+      nStatsKw(ids, monthStart, today, '__statsMonth__', TTL_STATS) as Promise<any[]>,
     ])
 
     function sumStats(rows: any[]) {
       const m: Record<string, { imp:number; clk:number; cost:number }> = {}
       for (const row of rows) {
         const id = row.id
-        const s = row.statData || row.stat || {}
+        // 네이버 stats API: statData 있을 수도, 직접 필드일 수도 있음
+        const s = (row.statData && typeof row.statData === 'object') ? row.statData
+                : (row.stat    && typeof row.stat    === 'object') ? row.stat
+                : row
         if (!m[id]) m[id] = { imp:0, clk:0, cost:0 }
         m[id].imp  += Number(s.impCnt  || 0)
         m[id].clk  += Number(s.clkCnt  || 0)
@@ -160,6 +190,8 @@ app.get('/api/data', async (c) => {
     const todayUsed      = Number(mainCamp?.totalChargeCost || 0)
     const todayRemain    = Math.max(0, dailyBudget - todayUsed)
 
+    const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))]
+
     return c.json({
       ok: true, isOn,
       camp: mainCamp ? {
@@ -177,7 +209,73 @@ app.get('/api/data', async (c) => {
         monthLabel:   today.slice(0,7),
       },
       keywords,
+      agIds,      // 트렌드/어제 실적 API용
       regions: REGIONS,
+      cachedAt: new Date().toISOString(),
+      statsTtlMin: Math.round(TTL_STATS / 60000),  // 캐시 TTL 분 단위 표시용
+    })
+  } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
+})
+
+// ── /api/yesterday: 어제 날짜 일별 실적 (광고그룹 ID 기준 DAY 단위) ──────────
+app.get('/api/yesterday', async (c) => {
+  try {
+    const [camps, adgroups] = await Promise.all([
+      nGet('/ncc/campaigns') as Promise<any[]>,
+      nGet('/ncc/adgroups')  as Promise<any[]>,
+    ])
+    const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))] as string[]
+
+    // 어제 날짜 계산 (KST 기준: UTC+9)
+    const kstNow = new Date(Date.now() + 9 * 3600 * 1000)
+    const yestStr = new Date(kstNow.getTime() - 86400000).toISOString().slice(0,10)
+    const todayStr = kstNow.toISOString().slice(0,10)
+
+    // 네이버 stats API 응답 파싱 헬퍼
+    // 응답 형태 A: { id, statData: { impCnt, clkCnt, salesAmt } }
+    // 응답 형태 B: { id, impCnt, clkCnt, salesAmt } (직접 필드)
+    function parseStatRows(rows: any[]) {
+      let imp = 0, clk = 0, cost = 0
+      for (const row of rows) {
+        const s = (row.statData && typeof row.statData === 'object') ? row.statData
+                : (row.stat    && typeof row.stat    === 'object') ? row.stat
+                : row
+        imp  += Number(s.impCnt   || 0)
+        clk  += Number(s.clkCnt   || 0)
+        cost += Number(s.salesAmt || 0)
+      }
+      return { imp, clk, cost }
+    }
+
+    // 어제 조회
+    const rawYest = await nStatsDay(agIds, yestStr, yestStr, `__yest_${yestStr}__`, TTL_STATS) as any[]
+    const { imp: yImp, clk: yClk, cost: yCost } = parseStatRows(rawYest)
+    const yCtr  = yImp > 0 ? +(yClk / yImp * 100).toFixed(2) : 0
+    const yCpc  = yClk > 0 ? Math.round(yCost / yClk) : 0
+
+    // 7일 트렌드: 날짜별 개별 조회 (date 필드 없는 문제 우회)
+    const trend7: { date:string; imp:number; clk:number; cost:number }[] = []
+    const dayRaws = await Promise.all(
+      Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(kstNow.getTime() - (7 - i) * 86400000).toISOString().slice(0,10)
+        return nStatsDay(agIds, d, d, `__day_${d}__`, TTL_STATS).then((rows: any) => ({ date: d, rows: rows as any[] }))
+      })
+    )
+    for (const { date, rows } of dayRaws) {
+      const p = parseStatRows(rows)
+      trend7.push({ date, ...p })
+    }
+
+    const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
+
+    return c.json({
+      ok: true,
+      yest: { date: yestStr, imp: yImp, clk: yClk, cost: yCost, ctr: yCtr, cpc: yCpc },
+      trend7,
+      rawCount: rawYest.length,
+      agCount:  agIds.length,
+      debug: { yestStr, todayStr, rawYestSample: rawYest.slice(0,2) },
+      campStatus: mainCamp?.status,
       cachedAt: new Date().toISOString(),
     })
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
@@ -195,8 +293,9 @@ app.post('/api/bid', async (c) => {
 })
 
 app.delete('/api/cache', (c) => {
+  const cnt = Object.keys(cache).length
   Object.keys(cache).forEach(k => delete cache[k])
-  return c.json({ ok:true })
+  return c.json({ ok:true, cleared: cnt })
 })
 
 app.get('/api/history', async (c) => {
@@ -239,6 +338,7 @@ const PAGE = `<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:'Noto Sans KR',sans-serif}
 body{background:#f5f6f8;color:#1a1a2e;min-height:100vh;font-size:13px}
@@ -346,14 +446,34 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
 .spinner{width:32px;height:32px;border:3px solid var(--gray-200);border-top-color:var(--green);border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
+/* 어제 실적 카드 */
+.yest-card{background:linear-gradient(135deg,#f0fdf4 0%,#ecfdf5 100%);border:1px solid #a7f3d0;border-radius:10px;padding:16px 20px;margin-bottom:14px;box-shadow:var(--shadow)}
+.yest-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.yest-title{font-size:13px;font-weight:700;color:#065f46;display:flex;align-items:center;gap:6px}
+.yest-date{font-size:11px;color:#6b7280;background:#fff;border:1px solid #d1fae5;border-radius:20px;padding:2px 10px}
+.yest-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
+.yest-stat{text-align:center}
+.yest-stat-label{font-size:10px;color:#6b7280;margin-bottom:3px;font-weight:500}
+.yest-stat-val{font-size:20px;font-weight:700;line-height:1}
+.yest-stat-sub{font-size:10px;color:#9ca3af;margin-top:2px}
+.yest-empty{text-align:center;padding:20px;color:#6b7280;font-size:12px}
+.cache-badge{font-size:10px;color:#9ca3af;background:#f3f4f6;border:1px solid #e5e7eb;border-radius:20px;padding:2px 8px;display:inline-flex;align-items:center;gap:4px}
+.cache-badge.fresh{color:#059669;background:#ecfdf5;border-color:#a7f3d0}
+
+/* 트렌드 차트 */
+.chart-card{background:var(--white);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);margin-bottom:14px}
+.chart-wrap{padding:14px 18px 8px;position:relative;height:200px}
+
 /* 반응형 */
 @media(max-width:900px){
   .kpi-grid{grid-template-columns:repeat(2,1fr)}
   .main-grid{grid-template-columns:1fr!important}
+  .yest-stats{grid-template-columns:repeat(3,1fr)}
 }
 @media(max-width:600px){
   .kpi-grid{grid-template-columns:1fr 1fr}
   .wrap{padding:12px}
+  .yest-stats{grid-template-columns:repeat(2,1fr)}
 }
 </style>
 </head>
@@ -406,6 +526,37 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
       <div class="kpi-label">30일 클릭 · CPC</div>
       <div id="k-clk" class="kpi-val" style="color:var(--blue)">—</div>
       <div id="k-cpc" class="kpi-sub">평균 CPC —</div>
+    </div>
+  </div>
+
+  <!-- 어제 실적 카드 -->
+  <div class="yest-card" id="yest-card">
+    <div class="yest-header">
+      <div class="yest-title">
+        <i class="fas fa-chart-bar"></i>
+        어제 실적
+        <span id="yest-date-badge" class="yest-date">날짜 로딩중...</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span id="yest-cache-badge" class="cache-badge"><i class="fas fa-database"></i>캐시 1h</span>
+        <button class="btn btn-outline btn-sm" onclick="refreshYest()" id="yest-refresh-btn" style="font-size:11px;padding:4px 10px">
+          <i class="fas fa-sync-alt" id="yri"></i> 실적 새로고침
+        </button>
+      </div>
+    </div>
+    <div id="yest-body">
+      <div class="yest-empty"><div class="spinner" style="margin:0 auto 6px;width:20px;height:20px;border-width:2px"></div>어제 실적 불러오는 중...</div>
+    </div>
+  </div>
+
+  <!-- 7일 트렌드 차트 -->
+  <div class="chart-card" id="trend-card" style="display:none">
+    <div class="card-header">
+      <h3><i class="fas fa-chart-line" style="color:var(--blue)"></i>최근 7일 트렌드 <span style="font-size:11px;font-weight:400;color:var(--gray-400)">노출·클릭</span></h3>
+      <span id="trend-updated" style="font-size:10px;color:var(--gray-400)"></span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="trendChart"></canvas>
     </div>
   </div>
 
@@ -598,6 +749,8 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
 
 <script>
 let D = null
+let YD = null
+let trendChart = null
 
 // ────────────────────────── 초기 로드 ──────────────────────────
 async function init() {
@@ -613,6 +766,8 @@ async function init() {
     return
   }
   document.getElementById('loading').style.display = 'none'
+  // 어제 실적은 비동기로 따로 로드 (메인 로드 블로킹 안 함)
+  loadYesterday()
 }
 
 async function hardRefresh() {
@@ -623,8 +778,175 @@ async function hardRefresh() {
   D = await r.json()
   render()
   loadHistory()
+  // 새로고침 시 어제 실적도 갱신
+  await loadYesterday()
   ic.classList.remove('fa-spin')
   toast('데이터를 새로 불러왔습니다.', 'ok')
+}
+
+// ────────────────────────── 어제 실적 로드 ──────────────────────────
+async function loadYesterday() {
+  try {
+    const r = await fetch('/api/yesterday')
+    YD = await r.json()
+    renderYesterday()
+  } catch(e) {
+    document.getElementById('yest-body').innerHTML =
+      '<div class="yest-empty" style="color:#ef4444"><i class="fas fa-exclamation-triangle" style="margin-right:4px"></i>실적 조회 실패: ' + e.message + '</div>'
+  }
+}
+
+async function refreshYest() {
+  const ic = document.getElementById('yri')
+  const btn = document.getElementById('yest-refresh-btn')
+  ic.classList.add('fa-spin')
+  btn.disabled = true
+  // stats 캐시만 선택적으로 클리어 (전체 캐시 삭제보다 가볍게)
+  await fetch('/api/cache', { method:'DELETE' })
+  await loadYesterday()
+  ic.classList.remove('fa-spin')
+  btn.disabled = false
+  toast('어제 실적을 새로 불러왔습니다.', 'ok')
+}
+
+function renderYesterday() {
+  if (!YD) return
+  const yestBody = document.getElementById('yest-body')
+  const dateBadge = document.getElementById('yest-date-badge')
+
+  if (!YD.ok) {
+    yestBody.innerHTML = '<div class="yest-empty" style="color:#ef4444"><i class="fas fa-exclamation-triangle"></i> ' + (YD.error || '조회 실패') + '</div>'
+    return
+  }
+
+  const y = YD.yest || {}
+  // 날짜 표시 (MM.DD 형식)
+  const dLabel = y.date ? y.date.slice(5).replace('-','.') : '—'
+  dateBadge.textContent = dLabel + ' 기준'
+
+  // 캐시 배지 업데이트
+  const cacheBadge = document.getElementById('yest-cache-badge')
+  cacheBadge.className = 'cache-badge fresh'
+  const ca = YD.cachedAt ? new Date(YD.cachedAt).toLocaleTimeString('ko-KR',{hour:'2-digit',minute:'2-digit'}) : ''
+  cacheBadge.innerHTML = '<i class="fas fa-check-circle"></i>' + ca + ' 갱신'
+
+  const hasData = (y.imp > 0 || y.clk > 0)
+
+  if (!hasData && YD.rawCount === 0) {
+    yestBody.innerHTML =
+      '<div class="yest-empty">' +
+      '<i class="fas fa-moon" style="color:#9ca3af;margin-right:6px"></i>' +
+      '어제(' + dLabel + ') 실적 데이터 없음 — 광고 미집행 또는 집계 대기 중' +
+      '<div style="font-size:10px;color:#9ca3af;margin-top:4px">광고그룹 ' + (YD.agCount||0) + '개 조회 · rawCount=' + (YD.rawCount||0) + '</div>' +
+      '</div>'
+  } else {
+    yestBody.innerHTML =
+      '<div class="yest-stats">' +
+      stat('노출', y.imp > 0 ? y.imp.toLocaleString() : '0', '회', y.imp > 0 ? 'var(--gray-800)' : 'var(--gray-400)') +
+      stat('클릭', y.clk > 0 ? y.clk.toLocaleString() : '0', '회', y.clk > 0 ? '#2563eb' : 'var(--gray-400)') +
+      stat('CTR', y.imp > 0 ? y.ctr + '%' : '—', '', y.ctr >= 1 ? 'var(--green)' : y.ctr > 0 ? '#f59e0b' : 'var(--gray-400)') +
+      stat('비용', y.cost > 0 ? fmt(y.cost) : '0', '원', y.cost > 0 ? '#7c3aed' : 'var(--gray-400)') +
+      stat('CPC', y.cpc > 0 ? fmt(y.cpc) : '—', y.cpc > 0 ? '원' : '', y.cpc > 0 ? 'var(--gray-800)' : 'var(--gray-400)') +
+      '</div>'
+  }
+
+  // 세팅 가이드 (CTR 기반)
+  let guide = ''
+  if (y.imp > 0 && y.clk > 0) {
+    const ctr = y.ctr
+    if (ctr >= 1) {
+      guide = '<div style="margin-top:10px;padding:8px 12px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;font-size:11px;color:#065f46"><i class="fas fa-arrow-up" style="margin-right:5px"></i><strong>CTR ' + ctr + '%</strong> — 스윗스팟! 입찰가 -8% 조정 예정 (자동)</div>'
+    } else if (ctr > 0) {
+      guide = '<div style="margin-top:10px;padding:8px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;font-size:11px;color:#92400e"><i class="fas fa-minus" style="margin-right:5px"></i><strong>CTR ' + ctr + '%</strong> — 낮음. 입찰가 -10% 조정 예정 (자동)</div>'
+    }
+  } else if (y.imp === 0) {
+    guide = '<div style="margin-top:10px;padding:8px 12px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:11px;color:#1e40af"><i class="fas fa-arrow-up" style="margin-right:5px"></i>노출 없음 → 스케줄러가 입찰가 +15% 자동 상향</div>'
+  }
+  yestBody.innerHTML += guide
+
+  // 7일 차트 렌더
+  if (YD.trend7 && YD.trend7.length > 0) {
+    renderTrendChart(YD.trend7)
+  }
+}
+
+function stat(label, val, unit, color) {
+  return '<div class="yest-stat">' +
+    '<div class="yest-stat-label">' + label + '</div>' +
+    '<div class="yest-stat-val" style="color:' + color + '">' + val + '</div>' +
+    '<div class="yest-stat-sub">' + unit + '</div>' +
+    '</div>'
+}
+
+function renderTrendChart(trend7) {
+  const card = document.getElementById('trend-card')
+  card.style.display = 'block'
+
+  const labels = trend7.map(d => d.date.slice(5).replace('-','.'))
+  const impData = trend7.map(d => d.imp)
+  const clkData = trend7.map(d => d.clk)
+
+  const ctx = document.getElementById('trendChart').getContext('2d')
+  if (trendChart) { trendChart.destroy() }
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: '노출',
+          data: impData,
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239,68,68,.08)',
+          tension: .3,
+          pointRadius: 4,
+          pointBackgroundColor: '#ef4444',
+          fill: true,
+          yAxisID: 'y',
+        },
+        {
+          label: '클릭',
+          data: clkData,
+          borderColor: '#f59e0b',
+          backgroundColor: 'rgba(245,158,11,.08)',
+          tension: .3,
+          pointRadius: 5,
+          pointBackgroundColor: '#f59e0b',
+          fill: true,
+          yAxisID: 'y2',
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode:'index', intersect:false },
+      plugins: {
+        legend: { position:'top', labels:{ font:{ size:11 }, padding:12 } },
+        tooltip: {
+          callbacks: {
+            label: ctx => ctx.dataset.label + ': ' + ctx.parsed.y.toLocaleString() + (ctx.dataset.label === '노출' ? '회' : '회')
+          }
+        }
+      },
+      scales: {
+        x: { grid:{ color:'#f3f4f6' }, ticks:{ font:{ size:11 } } },
+        y: {
+          type:'linear', display:true, position:'left',
+          grid:{ color:'#f3f4f6' },
+          ticks:{ font:{ size:10 }, color:'#ef4444' },
+          title:{ display:true, text:'노출', color:'#ef4444', font:{ size:10 } }
+        },
+        y2: {
+          type:'linear', display:true, position:'right',
+          grid:{ drawOnChartArea:false },
+          ticks:{ font:{ size:10 }, color:'#f59e0b' },
+          title:{ display:true, text:'클릭', color:'#f59e0b', font:{ size:10 } }
+        },
+      }
+    }
+  })
+  document.getElementById('trend-updated').textContent = '7일(' + labels[0] + '~' + labels[labels.length-1] + ')'
 }
 
 // ────────────────────────── 렌더 ──────────────────────────
