@@ -220,7 +220,7 @@ app.get('/api/data', async (c) => {
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
 
-// ── /api/yesterday: 어제 날짜 일별 실적 (광고그룹 ID 기준 DAY 단위) ──────────
+// ── /api/yesterday: 어제 실적 (광고그룹 합산 + 키워드별 breakdown) ─────────
 app.get('/api/yesterday', async (c) => {
   try {
     const [camps, adgroups] = await Promise.all([
@@ -229,56 +229,87 @@ app.get('/api/yesterday', async (c) => {
     ])
     const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))] as string[]
 
-    // 어제 날짜 계산 (KST 기준: UTC+9)
-    const kstNow = new Date(Date.now() + 9 * 3600 * 1000)
-    const yestStr = new Date(kstNow.getTime() - 86400000).toISOString().slice(0,10)
-    const todayStr = kstNow.toISOString().slice(0,10)
+    // 키워드 목록 (캐시 재활용 — ncc 캐시 12h, API 추가 없음)
+    const kwBatch = await Promise.all(
+      adgroups.map((ag: any) =>
+        nGet('/ncc/keywords', { nccAdgroupId: ag.nccAdgroupId }).catch(() => []) as Promise<any[]>
+      )
+    )
+    const allKw: any[] = (kwBatch as any[][]).flat()
+    // 동일 키워드 중복 시 높은 입찰가 기준으로 dedup
+    const kwMap: Record<string, any> = {}
+    for (const k of allKw) {
+      if (EXCLUDE.has(k.keyword)) continue
+      if (!kwMap[k.keyword] || k.bidAmt > kwMap[k.keyword].bidAmt) kwMap[k.keyword] = k
+    }
+    const kwList = Object.values(kwMap)
+    const kwIds  = kwList.map((k: any) => k.nccKeywordId)
+    // id → keyword 이름 맵
+    const idToKw: Record<string, any> = {}
+    for (const k of kwList) idToKw[k.nccKeywordId] = k
 
-    // 네이버 stats API 응답 파싱 헬퍼
-    // 응답 형태 A: { id, statData: { impCnt, clkCnt, salesAmt } }
-    // 응답 형태 B: { id, impCnt, clkCnt, salesAmt } (직접 필드)
-    function parseStatRows(rows: any[]) {
-      let imp = 0, clk = 0, cost = 0
-      for (const row of rows) {
-        const s = (row.statData && typeof row.statData === 'object') ? row.statData
-                : (row.stat    && typeof row.stat    === 'object') ? row.stat
-                : row
-        imp  += Number(s.impCnt   || 0)
-        clk  += Number(s.clkCnt   || 0)
-        cost += Number(s.salesAmt || 0)
+    // 어제 날짜 (KST)
+    const kstNow  = new Date(Date.now() + 9 * 3600 * 1000)
+    const yestStr = new Date(kstNow.getTime() - 86400000).toISOString().slice(0,10)
+
+    // stats 응답 파싱 (statData 있거나 직접 필드 두 형태 모두 지원)
+    function parseStat(row: any) {
+      const s = (row.statData && typeof row.statData === 'object') ? row.statData
+              : (row.stat    && typeof row.stat    === 'object') ? row.stat
+              : row
+      return {
+        imp:  Number(s.impCnt   || 0),
+        clk:  Number(s.clkCnt   || 0),
+        cost: Number(s.salesAmt || 0),
       }
+    }
+    function sumRows(rows: any[]) {
+      let imp=0, clk=0, cost=0
+      for (const r of rows) { const p=parseStat(r); imp+=p.imp; clk+=p.clk; cost+=p.cost }
       return { imp, clk, cost }
     }
 
-    // 어제 조회 — TTL 2h
+    // ① 광고그룹 기준 합산 — TTL 2h (이미 캐시 있으면 API 0회)
     const rawYest = await nStatsDay(agIds, yestStr, yestStr, `__yest_${yestStr}__`, TTL_2H) as any[]
-    const { imp: yImp, clk: yClk, cost: yCost } = parseStatRows(rawYest)
-    const yCtr  = yImp > 0 ? +(yClk / yImp * 100).toFixed(2) : 0
-    const yCpc  = yClk > 0 ? Math.round(yCost / yClk) : 0
+    const { imp: yImp, clk: yClk, cost: yCost } = sumRows(rawYest)
+    const yCtr = yImp > 0 ? +(yClk / yImp * 100).toFixed(2) : 0
+    const yCpc = yClk > 0 ? Math.round(yCost / yClk) : 0
 
-    // 7일 트렌드: 날짜별 개별 조회 — TTL 6h (어제까지 데이터라 자주 안바뀜)
+    // ② 키워드별 어제 실적 — nStatsKw TOTAL, TTL 2h
+    //    캐시 키 분리 → __kwyest_날짜__ (30일 캐시와 구분)
+    //    API 1회로 전체 키워드 한꺼번에 조회 (클릭 있는 것만 필터)
+    const rawKwYest = kwIds.length
+      ? await nStatsKw(kwIds, yestStr, yestStr, `__kwyest_${yestStr}__`, TTL_2H) as any[]
+      : []
+
+    const kwYest = rawKwYest
+      .map((row: any) => {
+        const kw = idToKw[row.id]
+        if (!kw) return null
+        const { imp, clk, cost } = parseStat(row)
+        return { keyword: kw.keyword, bidAmt: kw.bidAmt, imp, clk, cost,
+                 ctr: imp > 0 ? +(clk/imp*100).toFixed(2) : 0,
+                 cpc: clk > 0 ? Math.round(cost/clk) : 0 }
+      })
+      .filter((r: any) => r && (r.clk > 0 || r.imp > 0))  // 노출이라도 있는 것만
+      .sort((a: any, b: any) => b.clk - a.clk || b.imp - a.imp)
+
+    // ③ 7일 트렌드 — TTL 6h (어제까지 데이터)
     const trend7: { date:string; imp:number; clk:number; cost:number }[] = []
     const dayRaws = await Promise.all(
       Array.from({ length: 7 }, (_, i) => {
         const d = new Date(kstNow.getTime() - (7 - i) * 86400000).toISOString().slice(0,10)
-        return nStatsDay(agIds, d, d, `__day_${d}__`, TTL_6H).then((rows: any) => ({ date: d, rows: rows as any[] }))
+        return nStatsDay(agIds, d, d, `__day_${d}__`, TTL_6H)
+          .then((rows: any) => ({ date: d, ...sumRows(rows as any[]) }))
       })
     )
-    for (const { date, rows } of dayRaws) {
-      const p = parseStatRows(rows)
-      trend7.push({ date, ...p })
-    }
-
-    const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
+    trend7.push(...dayRaws)
 
     return c.json({
       ok: true,
-      yest: { date: yestStr, imp: yImp, clk: yClk, cost: yCost, ctr: yCtr, cpc: yCpc },
+      yest:   { date: yestStr, imp: yImp, clk: yClk, cost: yCost, ctr: yCtr, cpc: yCpc },
+      kwYest,   // 키워드별 어제 실적 (클릭·노출 있는 것만)
       trend7,
-      rawCount: rawYest.length,
-      agCount:  agIds.length,
-      debug: { yestStr, todayStr, rawYestSample: rawYest.slice(0,2) },
-      campStatus: mainCamp?.status,
       cachedAt: new Date().toISOString(),
     })
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
@@ -855,42 +886,69 @@ function renderYesterday() {
 
   const hasData = (y.imp > 0 || y.clk > 0)
 
-  if (!hasData && YD.rawCount === 0) {
+  if (!hasData) {
     yestBody.innerHTML =
       '<div class="yest-empty">' +
       '<i class="fas fa-moon" style="color:#9ca3af;margin-right:6px"></i>' +
-      '어제(' + dLabel + ') 실적 데이터 없음 — 광고 미집행 또는 집계 대기 중' +
-      '<div style="font-size:10px;color:#9ca3af;margin-top:4px">광고그룹 ' + (YD.agCount||0) + '개 조회 · rawCount=' + (YD.rawCount||0) + '</div>' +
-      '</div>'
+      '어제(' + dLabel + ') 실적 없음 — 광고 미집행 또는 집계 대기 중</div>'
   } else {
+    // ① 합산 KPI
     yestBody.innerHTML =
       '<div class="yest-stats">' +
-      stat('노출', y.imp > 0 ? y.imp.toLocaleString() : '0', '회', y.imp > 0 ? 'var(--gray-800)' : 'var(--gray-400)') +
+      stat('노출', y.imp.toLocaleString(), '회',  'var(--gray-800)') +
       stat('클릭', y.clk > 0 ? y.clk.toLocaleString() : '0', '회', y.clk > 0 ? '#2563eb' : 'var(--gray-400)') +
-      stat('CTR', y.imp > 0 ? y.ctr + '%' : '—', '', y.ctr >= 1 ? 'var(--green)' : y.ctr > 0 ? '#f59e0b' : 'var(--gray-400)') +
-      stat('비용', y.cost > 0 ? fmt(y.cost) : '0', '원', y.cost > 0 ? '#7c3aed' : 'var(--gray-400)') +
-      stat('CPC', y.cpc > 0 ? fmt(y.cpc) : '—', y.cpc > 0 ? '원' : '', y.cpc > 0 ? 'var(--gray-800)' : 'var(--gray-400)') +
+      stat('CTR',  y.imp > 0 ? y.ctr + '%' : '—', '', y.ctr >= 1 ? 'var(--green)' : y.ctr > 0 ? '#f59e0b' : 'var(--gray-400)') +
+      stat('비용',  y.cost > 0 ? fmt(y.cost) + '원' : '0원', '', y.cost > 0 ? '#7c3aed' : 'var(--gray-400)') +
+      stat('CPC',  y.cpc  > 0 ? fmt(y.cpc)  + '원' : '—',   '', y.cpc  > 0 ? 'var(--gray-800)' : 'var(--gray-400)') +
       '</div>'
   }
 
-  // 세팅 가이드 (CTR 기반)
-  let guide = ''
-  if (y.imp > 0 && y.clk > 0) {
-    const ctr = y.ctr
-    if (ctr >= 1) {
-      guide = '<div style="margin-top:10px;padding:8px 12px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;font-size:11px;color:#065f46"><i class="fas fa-arrow-up" style="margin-right:5px"></i><strong>CTR ' + ctr + '%</strong> — 스윗스팟! 입찰가 -8% 조정 예정 (자동)</div>'
-    } else if (ctr > 0) {
-      guide = '<div style="margin-top:10px;padding:8px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;font-size:11px;color:#92400e"><i class="fas fa-minus" style="margin-right:5px"></i><strong>CTR ' + ctr + '%</strong> — 낮음. 입찰가 -10% 조정 예정 (자동)</div>'
+  // ② 키워드별 breakdown (노출·클릭 있는 것만)
+  const kws = YD.kwYest || []
+  if (kws.length > 0) {
+    let tbl = '<div style="margin-top:12px;border-top:1px solid #d1fae5;padding-top:10px">'
+    const clkNote = y.clk > 0
+      ? ' <span style="color:#2563eb">(클릭 ' + y.clk + '건은 광고그룹 집계 기준 — 키워드별 클릭은 API 미지원)</span>'
+      : ''
+    tbl += '<div style="font-size:11px;font-weight:600;color:#065f46;margin-bottom:6px"><i class="fas fa-list" style="margin-right:4px"></i>키워드별 노출 현황' + clkNote + '</div>'
+    tbl += '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+    tbl += '<thead><tr style="background:#f0fdf4">'
+    tbl += '<th style="padding:5px 8px;text-align:left;color:#6b7280;font-weight:600;font-size:11px">키워드</th>'
+    tbl += '<th style="padding:5px 8px;text-align:right;color:#6b7280;font-weight:600;font-size:11px">입찰가</th>'
+    tbl += '<th style="padding:5px 8px;text-align:right;color:#6b7280;font-weight:600;font-size:11px">노출</th>'
+    tbl += '</tr></thead><tbody>'
+    for (const k of kws) {
+      // 노출 비율 바 (최대 기준)
+      const maxImp = Math.max(...kws.map((x:any) => x.imp), 1)
+      const pct = Math.round(k.imp / maxImp * 100)
+      tbl += '<tr style="border-bottom:1px solid #f0fdf4">'
+      tbl += '<td style="padding:6px 8px;font-weight:600;color:#1f2937">' + k.keyword + '</td>'
+      tbl += '<td style="padding:6px 8px;text-align:right;color:#2563eb;white-space:nowrap">' + fmt(k.bidAmt) + '원</td>'
+      tbl += '<td style="padding:6px 8px;min-width:100px">'
+        + '<div style="display:flex;align-items:center;gap:5px;justify-content:flex-end">'
+        + '<div style="flex:1;max-width:60px;height:5px;background:#e5e7eb;border-radius:3px;overflow:hidden">'
+        + '<div style="width:' + pct + '%;height:100%;background:#03C75A;border-radius:3px"></div></div>'
+        + '<span style="font-size:12px;color:#374151;min-width:28px;text-align:right">' + k.imp + '</span>'
+        + '</div></td>'
+      tbl += '</tr>'
     }
+    tbl += '</tbody></table></div>'
+    yestBody.innerHTML += tbl
+  }
+
+  // ③ 세팅 가이드
+  let guide = ''
+  if (y.ctr >= 1) {
+    guide = '<div style="margin-top:10px;padding:7px 12px;background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;font-size:11px;color:#065f46"><i class="fas fa-check-circle" style="margin-right:4px"></i>CTR ' + y.ctr + '% — 스윗스팟. 입찰가 -8% 자동 조정 예정</div>'
+  } else if (y.ctr > 0) {
+    guide = '<div style="margin-top:10px;padding:7px 12px;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;font-size:11px;color:#92400e"><i class="fas fa-minus-circle" style="margin-right:4px"></i>CTR ' + y.ctr + '% — 낮음. 입찰가 -10% 자동 조정 예정</div>'
   } else if (y.imp === 0) {
-    guide = '<div style="margin-top:10px;padding:8px 12px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:11px;color:#1e40af"><i class="fas fa-arrow-up" style="margin-right:5px"></i>노출 없음 → 스케줄러가 입찰가 +15% 자동 상향</div>'
+    guide = '<div style="margin-top:10px;padding:7px 12px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;font-size:11px;color:#1e40af"><i class="fas fa-arrow-up" style="margin-right:4px"></i>노출 없음 → 입찰가 +15% 자동 상향 예정</div>'
   }
   yestBody.innerHTML += guide
 
-  // 7일 차트 렌더
-  if (YD.trend7 && YD.trend7.length > 0) {
-    renderTrendChart(YD.trend7)
-  }
+  // ④ 차트
+  if (YD.trend7 && YD.trend7.length > 0) renderTrendChart(YD.trend7)
 }
 
 function stat(label, val, unit, color) {
