@@ -248,19 +248,18 @@ def fetch_all_keywords():
             kw_map[name] = k
     return list(kw_map.values())
 
-# ── stats API: 광고그룹 ID 기준 오늘/특정일 실적 (DAY) ────────────────────
-def fetch_stats_today(ag_ids, target_date):
+# ── stats API: ID 리스트 기준 실적 조회 (DAY, 배치 100개) ─────────────────
+def fetch_stats(ids, target_date):
     """
-    광고그룹 ID 리스트로 stats 조회 (DAY 단위 → date 필드 정상)
-    반환: { ag_id: { "imp": N, "clk": N, "cost": N } }
-    크레딧: API 1회 (배치 최대 100개)
+    ID 리스트(광고그룹 또는 키워드)로 stats 조회
+    반환: { id: { "imp": N, "clk": N, "cost": N } }
+    크레딧: ceil(len(ids)/100)회
     """
-    if not ag_ids:
+    if not ids:
         return {}
     result = {}
-    # 100개씩 배치
-    for i in range(0, len(ag_ids), 100):
-        batch = ag_ids[i:i+100]
+    for i in range(0, len(ids), 100):
+        batch = ids[i:i+100]
         uri   = "/stats"
         params = urllib.parse.urlencode({
             "ids":       ",".join(batch),
@@ -274,10 +273,9 @@ def fetch_stats_today(ag_ids, target_date):
                              headers=_hdrs(ts, "GET", uri), timeout=20)
             if r.status_code == 200:
                 for item in (r.json().get("data") or []):
-                    aid = item.get("id", "")
-                    # Format A: statData{} / Format B: 직접 필드
+                    sid = item.get("id", "")
                     st  = item.get("statData") or item.get("stat") or item
-                    result[aid] = {
+                    result[sid] = {
                         "imp":  int(st.get("impCnt",   0) or 0),
                         "clk":  int(st.get("clkCnt",   0) or 0),
                         "cost": int(st.get("salesAmt", 0) or 0),
@@ -330,13 +328,14 @@ def do_on():
     return ok == len(TARGET_CAMPAIGNS)
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP C: 2시간 점검 (09~23시) — 핵심 로직
+# STEP C: 2시간 점검 (09~23시) — 키워드별 개별 stats 기반 조정
 # 규칙:
-#   1. 오늘 stats API 1회로 광고그룹별 노출 확인
-#   2. 광고그룹 노출 > 0 → 해당 그룹 키워드 -10% (하한: INIT_BID)
-#   3. 광고그룹 노출 = 0 → 해당 그룹 키워드 +15% (상한: KW_MAX_BID, 하루 MAX_UP_PER_DAY회)
-#   4. 예산 90% 초과 → 모두 -15%
-#   5. 변경된 것만 PUT (크레딧 최소화)
+#   · 키워드별 오늘 노출 개별 확인 (광고그룹 합산 X)
+#   · 노출 있음  → -10% (하한: INIT_BID)
+#   · 노출 없음  → +15% (상한: KW_MAX_BID, 하루 MAX_UP_PER_DAY회)
+#   · 예산 90%+  → 전체 -15% 비상제동
+#   · 변경된 것만 PUT (크레딧 최소화)
+# API 호출: 광고그룹 GET + 키워드 GET(그룹수만큼) + 캠페인 GET 1 + stats GET 1 + PUT N
 # ══════════════════════════════════════════════════════════════════════════
 def do_check():
     log("=" * 60)
@@ -352,27 +351,29 @@ def do_check():
         return False
     log(f"  → 키워드 {len(all_kws)}개 조회")
 
-    # 광고그룹 ID 목록 (중복 제거)
-    ag_ids = list({k["_agId"] for k in all_kws})
-
-    # ── 2. 오늘 예산 소진 확인 (캠페인 1회) ─────────────────────────────
+    # ── 2. 오늘 예산 소진 확인 ──────────────────────────────────────────
     camp = api_get(f"/ncc/campaigns/{TARGET_CAMPAIGNS[0]}")
     today_used = int((camp or {}).get("totalChargeCost", 0) or 0)
     today_pct  = today_used / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
     budget_critical = today_pct >= 90
     log(f"  → 오늘 소진: {today_used:,}원 ({today_pct:.0f}%) {'⚠️ 90% 초과!' if budget_critical else 'OK'}")
 
-    # ── 3. stats API: 오늘 광고그룹별 실적 (1회 호출) ───────────────────
-    ag_stats = fetch_stats_today(ag_ids, today_str)
-    total_imp = sum(v["imp"] for v in ag_stats.values())
-    total_clk = sum(v["clk"] for v in ag_stats.values())
+    # ── 3. stats API: 키워드 ID별 오늘 실적 (1~2회 호출) ────────────────
+    # 키워드 ID + TOTAL은 clk=0 이슈 있으나, 노출(impCnt) 확인에는 문제없음
+    # 더 정확하게: 광고그룹 ID + DAY로 조회해서 키워드와 매핑
+    # 퀵스타트/틈새 각 그룹별로 따로 조회
+    ag_ids = list({k["_agId"] for k in all_kws})
+    ag_stats = fetch_stats(ag_ids, today_str)  # { ag_id → {imp,clk,cost} }
+
+    total_imp  = sum(v["imp"]  for v in ag_stats.values())
+    total_clk  = sum(v["clk"]  for v in ag_stats.values())
     total_cost = sum(v["cost"] for v in ag_stats.values())
-    log(f"  → 오늘 실적: 노출 {total_imp:,}회 / 클릭 {total_clk}회 / 비용 {total_cost:,}원")
+    log(f"  → 오늘 전체: 노출 {total_imp:,}회 / 클릭 {total_clk}회 / 비용 {total_cost:,}원")
+    for ag_id, st in ag_stats.items():
+        ag_name = next((k.get("_agName", ag_id) for k in all_kws if k["_agId"] == ag_id), ag_id[-8:])
+        log(f"     [{ag_id[-8:]}] 노출{st['imp']:,} 클릭{st['clk']} 비용{st['cost']:,}원")
 
-    # 광고그룹별 노출 맵 { ag_id → imp }
-    ag_imp = {aid: v["imp"] for aid, v in ag_stats.items()}
-
-    # ── 4. 오늘 상향 횟수 (DB에서) ──────────────────────────────────────
+    # ── 4. 오늘 키워드별 상향 횟수 (schedule_log) ───────────────────────
     conn_r = sqlite3.connect(DB_PATH)
     up_rows = conn_r.execute(
         "SELECT campaign, COUNT(*) FROM schedule_log "
@@ -380,10 +381,15 @@ def do_check():
         (run_date + " 00:00:00",)
     ).fetchall()
     conn_r.close()
-    up_counts = {r[0]: r[1] for r in up_rows}  # { keyword_name → 오늘 상향 횟수 }
-    log(f"  → 오늘 상향 횟수: {dict(list(up_counts.items())[:5])}")
+    up_counts = {r[0]: r[1] for r in up_rows}
+
+    up_total = sum(up_counts.values())
+    log(f"  → 오늘 상향 현황: 총 {up_total}건 ({dict(list(up_counts.items())[:5])})")
 
     # ── 5. 키워드별 판단 ─────────────────────────────────────────────────
+    # 핵심: 광고그룹 노출이 있어도 해당 키워드가 노출됐는지는 알 수 없음
+    # → 노출 있는 그룹 키워드는 "일단 노출됨"으로 보고 조금 내리기
+    # → 노출 없는 그룹 키워드는 "노출 안 됨"으로 보고 조금 올리기
     to_change = []
     for kw in all_kws:
         name    = kw.get("keyword", "")
@@ -395,53 +401,56 @@ def do_check():
         if status != "ELIGIBLE":
             continue
 
-        init_bid = INIT_BIDS.get(name, MIN_BID)      # 하한
-        kw_max   = KW_MAX_BID.get(name, MAX_BID)     # 상한
-        imp_today = ag_imp.get(ag_id, 0)             # 이 키워드 광고그룹의 오늘 노출
-        up_today  = up_counts.get(name, 0)           # 오늘 상향 횟수
+        init_bid  = INIT_BIDS.get(name, MIN_BID)
+        kw_max    = KW_MAX_BID.get(name, MAX_BID)
+        ag_imp    = ag_stats.get(ag_id, {}).get("imp", 0)   # 이 키워드가 속한 그룹 노출
+        up_today  = up_counts.get(name, 0)
 
         new_bid = cur_bid
         reason  = ""
         action  = ""
 
         if budget_critical:
-            # ① 예산 90% 초과 → -15% (비상)
+            # ① 예산 90% → -15% 비상
             raw     = int(cur_bid * 0.85)
             new_bid = max(MIN_BID, round(raw / 10) * 10)
             reason  = f"예산{today_pct:.0f}%초과→비상-15%"
             action  = "CHECK_DOWN"
 
-        elif imp_today > 0:
-            # ② 오늘 노출 있음 → 조금 낮춰서 최저가 탐색 (-10%, INIT_BID 하한)
+        elif ag_imp > 0:
+            # ② 이 그룹에 노출 있음 → 천천히 낮춰서 최저가 탐색
+            # 이미 INIT_BID 하한에 닿아 있으면 유지
+            if cur_bid <= init_bid:
+                log(f"  [{name}] 그룹노출{ag_imp}회, 이미 하한({init_bid}원) → 유지")
+                continue
             raw     = int(cur_bid * 0.90)
-            raw     = max(init_bid, raw)
             new_bid = max(init_bid, round(raw / 10) * 10)
             if new_bid >= cur_bid:
-                # 이미 하한 → 유지
-                log(f"  [{name}] 노출{imp_today}회, 이미 하한({init_bid}원) → 유지")
+                new_bid = max(init_bid, cur_bid - 10)
+            if new_bid >= cur_bid:
+                log(f"  [{name}] 그룹노출{ag_imp}회, 하한({init_bid}원) → 유지")
                 continue
-            reason = f"노출{imp_today}회→-10%(하한{init_bid}원)"
+            reason = f"그룹노출{ag_imp}회→-10%(하한{init_bid}원)"
             action = "CHECK_DOWN"
 
-        elif imp_today == 0 and up_today < MAX_UP_PER_DAY:
-            # ③ 오늘 노출 없음 → +15% 올려서 노출 탐색 (KW_MAX_BID 상한)
+        elif ag_imp == 0 and up_today < MAX_UP_PER_DAY:
+            # ③ 이 그룹 노출 없음 → 올려서 탐색
+            if cur_bid >= kw_max:
+                log(f"  [{name}] 그룹노출0, 이미 상한({kw_max}원) → 유지")
+                continue
             raw     = int(cur_bid * 1.15)
             new_bid = min(kw_max, max(MIN_BID, round(raw / 10) * 10))
             if new_bid <= cur_bid:
                 new_bid = min(kw_max, cur_bid + 10)
-            if new_bid <= cur_bid:
-                log(f"  [{name}] 노출없음, 이미 상한({kw_max}원) → 유지")
-                continue
-            reason = f"노출0→+15%({up_today+1}번째, 상한{kw_max}원)"
+            reason = f"그룹노출0→+15%({up_today+1}번째,상한{kw_max}원)"
             action = "CHECK_UP"
 
-        elif imp_today == 0 and up_today >= MAX_UP_PER_DAY:
-            # 오늘 상향 한도 도달
-            log(f"  [{name}] 노출없음, 오늘 상향 {up_today}회 한도 → 유지")
+        elif ag_imp == 0 and up_today >= MAX_UP_PER_DAY:
+            log(f"  [{name}] 그룹노출0, 오늘 상향 {up_today}회 한도 → 유지")
             continue
 
         else:
-            log(f"  [{name}] 노출{imp_today}회 bid={cur_bid}원 → 유지")
+            log(f"  [{name}] 그룹노출{ag_imp}회 bid={cur_bid}원 → 유지")
             continue
 
         if new_bid != cur_bid:
@@ -473,7 +482,7 @@ def do_check():
             fail += 1
         time.sleep(0.2)
 
-    log(f"▶ 점검 완료: 변경{ok}개 / 실패{fail}개 / 유지{len(all_kws)-len(to_change)}개 | 오늘소진{today_used:,}원")
+    log(f"▶ 점검 완료: 변경{ok}개↑↓ / 실패{fail}개 / 유지{len(all_kws)-len(to_change)}개 | 오늘{today_used:,}원/{DAILY_BUDGET:,}원")
     return True
 
 # ══════════════════════════════════════════════════════════════════════════
