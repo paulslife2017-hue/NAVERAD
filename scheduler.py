@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-네이버 광고 스케줄러 v3
-- 새벽 01:00 → 광고 OFF
-- 아침 07:00 → 광고 ON (입찰가 건드리지 않음)
-- 2시간마다(09~23시) → stats API로 오늘 실적 확인 후 조금씩 조정
-  · 노출 있음  → 조금 내리기 (-10%, INIT_BID 하한)
-  · 노출 없음  → 조금 올리기 (+15%, KW_MAX_BID 상한)
-  · 예산 90%+  → 비상 삭감 (-15%)
-크레딧 최소화: API 호출 = 광고그룹별 keywords GET + campaign GET + stats GET 1회 + 변경된 것만 PUT
+네이버 광고 스케줄러 v4
+[파워링크]
+- 새벽 01:00 → 캠페인 OFF
+- 아침 07:00 → 캠페인 ON
+- 2시간마다(09~23시) → 키워드별 입찰가 조정
+  · 그룹 노출 있음 → -10% (INIT_BID 하한)
+  · 그룹 노출 없음 → +15% (KW_MAX_BID 상한, 하루 MAX_UP_PER_DAY회)
+  · 예산 90%+       → -15% 비상
+[플레이스]
+- 동일 스케줄 (OFF/ON/2h점검)
+- 키워드 없음 → 광고그룹 bidAmt 단일 조정
+  · 노출 있음 → -10% (PLACE_MIN_BID 하한)
+  · 노출 없음 → +20% (PLACE_MAX_BID 상한, 하루 MAX_UP_PER_DAY회)
+  · 예산 90%+ → -15% 비상
 """
 import hashlib, hmac, base64, time, requests, json, sqlite3, os, sys, urllib.parse
 from datetime import datetime, timedelta
@@ -21,14 +27,24 @@ BASE = "https://api.naver.com"
 DB_PATH  = "/home/user/webapp/data/naver_ad.db"
 LOG_PATH = "/home/user/webapp/data/scheduler.log"
 
-TARGET_CAMPAIGNS = ["cmp-a001-01-000000010736912"]
+# ── 파워링크 캠페인 ───────────────────────────────────────────────────────
+PL_CAMPAIGN_IDS = ["cmp-a001-01-000000010736912"]   # 파워링크#1
+TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환
 
-# ── 예산/입찰 설정 ─────────────────────────────────────────────────────────
+# ── 플레이스 캠페인/그룹 ──────────────────────────────────────────────────
+PLACE_CAMPAIGN_ID = "cmp-a001-06-000000010731200"
+PLACE_AG_ID       = "grp-a001-06-000000068627534"
+PLACE_DAILY_BUDGET = 10_000   # 플레이스 일 예산
+PLACE_MIN_BID      = 70       # 플레이스 하한
+PLACE_MAX_BID      = 3_000    # 플레이스 상한
+PLACE_INIT_BID     = 300      # 플레이스 기본 시작 입찰가
+
+# ── 파워링크 예산/입찰 설정 ────────────────────────────────────────────────
 DAILY_BUDGET = 50_000
 MIN_BID      = 70
 MAX_BID      = 1_000   # 기본 상한 (키워드별 KW_MAX_BID 우선)
 
-# 2시간 점검에서 하루 최대 상향 횟수 (노출 없을 때)
+# 2시간 점검에서 하루 최대 상향 횟수
 MAX_UP_PER_DAY = 3
 
 # ── 제외 키워드 ────────────────────────────────────────────────────────────
@@ -288,44 +304,74 @@ def fetch_stats(ids, target_date):
     return result
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP A: 광고 OFF (새벽 1시)
+# STEP A: 광고 OFF (새벽 1시) — 파워링크 + 플레이스
 # ══════════════════════════════════════════════════════════════════════════
 def do_off():
     log("=" * 60)
-    log("▶ 광고 OFF (새벽 1시)")
-    ok = 0
+    log("▶ 광고 OFF (새벽 1시) — 파워링크 + 플레이스")
+
+    # [파워링크] 캠페인 OFF
+    ok_pl = 0
     for cid in TARGET_CAMPAIGNS:
         sc, res = api_put(f"/ncc/campaigns/{cid}", {"userLock": True}, "userLock")
         if sc == 200:
-            log(f"  ✅ OFF 성공: {cid}")
+            log(f"  ✅ [파워링크] OFF 성공: {cid}")
             db_log("OFF", cid, True, f"status={res.get('status','?')}")
-            ok += 1
+            ok_pl += 1
         else:
-            log(f"  ❌ OFF 실패: {cid} → {res}")
+            log(f"  ❌ [파워링크] OFF 실패: {cid} → {res}")
             db_log("OFF", cid, False, str(res))
         time.sleep(0.3)
-    log(f"▶ OFF 완료: {ok}/{len(TARGET_CAMPAIGNS)}")
-    return ok == len(TARGET_CAMPAIGNS)
+
+    # [플레이스] 캠페인 OFF
+    sc, res = api_put(f"/ncc/campaigns/{PLACE_CAMPAIGN_ID}", {"userLock": True}, "userLock")
+    if sc == 200:
+        log(f"  ✅ [플레이스] OFF 성공: {PLACE_CAMPAIGN_ID}")
+        db_log("OFF", PLACE_CAMPAIGN_ID, True, f"status={res.get('status','?')}")
+        ok_place = 1
+    else:
+        log(f"  ❌ [플레이스] OFF 실패: {PLACE_CAMPAIGN_ID} → {res}")
+        db_log("OFF", PLACE_CAMPAIGN_ID, False, str(res))
+        ok_place = 0
+    time.sleep(0.3)
+
+    log(f"▶ OFF 완료: 파워링크 {ok_pl}/{len(TARGET_CAMPAIGNS)} / 플레이스 {ok_place}/1")
+    return ok_pl == len(TARGET_CAMPAIGNS) and ok_place == 1
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP B: 광고 ON (아침 7시) — 입찰가 건드리지 않음
+# STEP B: 광고 ON (아침 7시) — 파워링크 + 플레이스, 입찰가 건드리지 않음
 # ══════════════════════════════════════════════════════════════════════════
 def do_on():
     log("=" * 60)
-    log("▶ 광고 ON (아침 7시) — 입찰가는 2시간 점검에서 조정")
-    ok = 0
+    log("▶ 광고 ON (아침 7시) — 파워링크 + 플레이스 | 입찰가는 2시간 점검에서 조정")
+
+    # [파워링크] 캠페인 ON
+    ok_pl = 0
     for cid in TARGET_CAMPAIGNS:
         sc, res = api_put(f"/ncc/campaigns/{cid}", {"userLock": False}, "userLock")
         if sc == 200:
-            log(f"  ✅ ON 성공: {cid} → status={res.get('status','?')}")
+            log(f"  ✅ [파워링크] ON 성공: {cid} → status={res.get('status','?')}")
             db_log("ON", cid, True, f"status={res.get('status','?')}")
-            ok += 1
+            ok_pl += 1
         else:
-            log(f"  ❌ ON 실패: {cid} → {res}")
+            log(f"  ❌ [파워링크] ON 실패: {cid} → {res}")
             db_log("ON", cid, False, str(res))
         time.sleep(0.3)
-    log(f"▶ ON 완료: {ok}/{len(TARGET_CAMPAIGNS)}")
-    return ok == len(TARGET_CAMPAIGNS)
+
+    # [플레이스] 캠페인 ON
+    sc, res = api_put(f"/ncc/campaigns/{PLACE_CAMPAIGN_ID}", {"userLock": False}, "userLock")
+    if sc == 200:
+        log(f"  ✅ [플레이스] ON 성공: {PLACE_CAMPAIGN_ID} → status={res.get('status','?')}")
+        db_log("ON", PLACE_CAMPAIGN_ID, True, f"status={res.get('status','?')}")
+        ok_place = 1
+    else:
+        log(f"  ❌ [플레이스] ON 실패: {PLACE_CAMPAIGN_ID} → {res}")
+        db_log("ON", PLACE_CAMPAIGN_ID, False, str(res))
+        ok_place = 0
+    time.sleep(0.3)
+
+    log(f"▶ ON 완료: 파워링크 {ok_pl}/{len(TARGET_CAMPAIGNS)} / 플레이스 {ok_place}/1")
+    return ok_pl == len(TARGET_CAMPAIGNS) and ok_place == 1
 
 # ══════════════════════════════════════════════════════════════════════════
 # STEP C: 2시간 점검 (09~23시) — 키워드별 개별 stats 기반 조정
@@ -486,6 +532,128 @@ def do_check():
     return True
 
 # ══════════════════════════════════════════════════════════════════════════
+# STEP D: 플레이스 2시간 점검 — 광고그룹 bidAmt 단일 조정
+# 규칙:
+#   · 오늘 노출 있음  → -10% (하한: PLACE_MIN_BID)
+#   · 오늘 노출 없음  → +20% (상한: PLACE_MAX_BID, 하루 MAX_UP_PER_DAY회)
+#   · 예산 90%+       → -15% 비상제동
+# API 호출: stats GET 1 + 캠페인 GET 1 + 광고그룹 GET 1 + PUT 0~1
+# ══════════════════════════════════════════════════════════════════════════
+def do_check_place():
+    log("-" * 60)
+    log(f"▶ [플레이스] 2시간 점검 ({datetime.now().strftime('%H:%M')} KST)")
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    run_date  = today_str
+
+    # ── 1. 오늘 플레이스 노출 조회 (stats API) ───────────────────────────
+    place_stats = fetch_stats([PLACE_AG_ID], today_str)
+    st = place_stats.get(PLACE_AG_ID, {"imp": 0, "clk": 0, "cost": 0})
+    place_imp  = st["imp"]
+    place_clk  = st["clk"]
+    place_cost = st["cost"]
+    log(f"  → 플레이스 오늘: 노출 {place_imp:,}회 / 클릭 {place_clk}회 / 비용 {place_cost:,}원")
+
+    # ── 2. 플레이스 예산 소진 확인 ───────────────────────────────────────
+    camp = api_get(f"/ncc/campaigns/{PLACE_CAMPAIGN_ID}")
+    today_used = int((camp or {}).get("totalChargeCost", 0) or 0)
+    today_pct  = today_used / PLACE_DAILY_BUDGET * 100 if PLACE_DAILY_BUDGET > 0 else 0
+    budget_critical = today_pct >= 90
+    log(f"  → 플레이스 예산: {today_used:,}원/{PLACE_DAILY_BUDGET:,}원 ({today_pct:.0f}%) "
+        f"{'⚠️ 90% 초과!' if budget_critical else 'OK'}")
+
+    # ── 3. 현재 광고그룹 입찰가 조회 ─────────────────────────────────────
+    ag = api_get(f"/ncc/adgroups/{PLACE_AG_ID}")
+    if not ag:
+        log("  ❌ 플레이스 광고그룹 조회 실패 → 중단")
+        return False
+    cur_bid = int(ag.get("bidAmt", PLACE_INIT_BID))
+    ag_status = ag.get("status", "")
+    log(f"  → 플레이스 현재 입찰가: {cur_bid}원 / status={ag_status}")
+
+    # ── 4. 오늘 플레이스 상향 횟수 (schedule_log) ────────────────────────
+    conn_r = sqlite3.connect(DB_PATH)
+    up_today = conn_r.execute(
+        "SELECT COUNT(*) FROM schedule_log "
+        "WHERE action='PLACE_CHECK_UP' AND run_at >= ?",
+        (run_date + " 00:00:00",)
+    ).fetchone()[0]
+    conn_r.close()
+    log(f"  → 플레이스 오늘 상향 횟수: {up_today}/{MAX_UP_PER_DAY}")
+
+    # ── 5. 입찰가 판단 ───────────────────────────────────────────────────
+    new_bid = cur_bid
+    reason  = ""
+    action  = ""
+
+    if budget_critical:
+        # ① 예산 90% 초과 → -15% 비상제동
+        raw     = int(cur_bid * 0.85)
+        new_bid = max(PLACE_MIN_BID, round(raw / 10) * 10)
+        reason  = f"예산{today_pct:.0f}%초과→비상-15%"
+        action  = "PLACE_CHECK_DOWN"
+        log(f"  ⚠️ 예산 90% 초과 비상 → {cur_bid}→{new_bid}원")
+
+    elif place_imp > 0:
+        # ② 노출 있음 → -10% (하한: PLACE_MIN_BID)
+        if cur_bid <= PLACE_MIN_BID:
+            log(f"  [플레이스] 노출 {place_imp}회, 이미 하한({PLACE_MIN_BID}원) → 유지")
+            return True
+        raw     = int(cur_bid * 0.90)
+        new_bid = max(PLACE_MIN_BID, round(raw / 10) * 10)
+        if new_bid >= cur_bid:
+            new_bid = max(PLACE_MIN_BID, cur_bid - 10)
+        if new_bid >= cur_bid:
+            log(f"  [플레이스] 노출 {place_imp}회, 하한({PLACE_MIN_BID}원) → 유지")
+            return True
+        reason = f"노출{place_imp}회→-10%(하한{PLACE_MIN_BID}원)"
+        action = "PLACE_CHECK_DOWN"
+        log(f"  → 노출 있음: {cur_bid}→{new_bid}원 ({reason})")
+
+    elif place_imp == 0 and up_today < MAX_UP_PER_DAY:
+        # ③ 노출 없음 → +20% (상한: PLACE_MAX_BID)
+        if cur_bid >= PLACE_MAX_BID:
+            log(f"  [플레이스] 노출 0, 이미 상한({PLACE_MAX_BID}원) → 유지")
+            return True
+        raw     = int(cur_bid * 1.20)
+        new_bid = min(PLACE_MAX_BID, max(PLACE_MIN_BID, round(raw / 10) * 10))
+        if new_bid <= cur_bid:
+            new_bid = min(PLACE_MAX_BID, cur_bid + 10)
+        reason = f"노출0→+20%({up_today+1}번째,상한{PLACE_MAX_BID}원)"
+        action = "PLACE_CHECK_UP"
+        log(f"  → 노출 없음: {cur_bid}→{new_bid}원 ({reason})")
+
+    elif place_imp == 0 and up_today >= MAX_UP_PER_DAY:
+        log(f"  [플레이스] 노출 0, 오늘 상향 {up_today}회 한도({MAX_UP_PER_DAY}회) → 유지")
+        return True
+
+    else:
+        log(f"  [플레이스] 노출 {place_imp}회 bid={cur_bid}원 → 유지")
+        return True
+
+    # ── 6. 변경이 없으면 스킵 ────────────────────────────────────────────
+    if new_bid == cur_bid:
+        log(f"  [플레이스] 변경 없음 → 유지")
+        return True
+
+    # ── 7. PUT /ncc/adgroups/{id}?fields=bidAmt ───────────────────────────
+    uri = f"/ncc/adgroups/{PLACE_AG_ID}"
+    sc, res = api_put(uri, {"bidAmt": new_bid}, "bidAmt")
+    tag = "↑" if new_bid > cur_bid else "↓"
+    if sc == 200:
+        log(f"  ✅ [플레이스] {cur_bid}{tag}{new_bid}원 | {reason}")
+        push_history("[플레이스]", cur_bid, new_bid, reason)
+        db_log(action, PLACE_AG_ID, True, reason)
+    else:
+        log(f"  ❌ [플레이스] PUT 실패[{sc}]: {res}")
+        db_log(action, PLACE_AG_ID, False, str(res))
+        return False
+
+    log(f"▶ [플레이스] 점검 완료: {cur_bid}{tag}{new_bid}원 | 오늘 {today_used:,}원/{PLACE_DAILY_BUDGET:,}원")
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 메인
 # ══════════════════════════════════════════════════════════════════════════
 def main():
@@ -508,16 +676,26 @@ def main():
     elif arg == "check":
         if 9 <= now_h <= 23:
             do_check()
+            do_check_place()
         else:
             log(f"[SKIP] check: 현재 {now_h}시 (9~23시에만 실행)")
 
     elif arg == "force_check":
-        # 테스트용: 시간 무관 check 강제 실행
+        # 테스트용: 시간 무관 전체(파워링크+플레이스) 강제 실행
         do_check()
+        do_check_place()
+
+    elif arg == "force_place_check":
+        # 테스트용: 플레이스만 강제 실행
+        do_check_place()
 
     elif arg == "force_on":
         # 테스트용: 시간 무관 on 강제 실행
         do_on()
+
+    elif arg == "force_off":
+        # 테스트용: 시간 무관 off 강제 실행
+        do_off()
 
     else:
         # 시간 자동 판단
@@ -527,6 +705,7 @@ def main():
             do_on()
         elif 9 <= now_h <= 23:
             do_check()
+            do_check_place()
         else:
             log(f"현재 {now_h}시 → 스케줄 없음 (1시=OFF / 7시=ON / 9~23시=2h점검)")
 
