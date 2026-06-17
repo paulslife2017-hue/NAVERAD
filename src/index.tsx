@@ -116,10 +116,9 @@ async function nStatsDay(agIds: string[], since: string, until: string, ckey: st
 
 app.get('/api/data', async (c) => {
   try {
+    const lite = c.req.query('lite') === '1'  // lite=1: stats 스킵, 빠른 응답
     const now   = new Date()
     const today = now.toISOString().slice(0,10)
-    const since30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0,10)
-    const monthStart = today.slice(0,7) + '-01'
 
     const [camps, adgroups] = await Promise.all([
       nGet('/ncc/campaigns') as Promise<any[]>,
@@ -140,17 +139,10 @@ app.get('/api/data', async (c) => {
     const activeKw = Object.values(kwMap).filter((k: any) => !EXCLUDE.has(k.keyword))
     const ids = activeKw.map((k: any) => k.nccKeywordId)
 
-    // stats: TOTAL 단위로 조회 (date:"?" 문제 회피) — TTL 3h (크레딧 절약)
-    const [statsRaw30, statsRawMonth] = await Promise.all([
-      nStatsKw(ids, since30,    today, '__stats30__',    TTL_3H) as Promise<any[]>,
-      nStatsKw(ids, monthStart, today, '__statsMonth__', TTL_3H) as Promise<any[]>,
-    ])
-
     function sumStats(rows: any[]) {
       const m: Record<string, { imp:number; clk:number; cost:number }> = {}
       for (const row of rows) {
         const id = row.id
-        // 네이버 stats API: statData 있을 수도, 직접 필드일 수도 있음
         const s = (row.statData && typeof row.statData === 'object') ? row.statData
                 : (row.stat    && typeof row.stat    === 'object') ? row.stat
                 : row
@@ -161,8 +153,31 @@ app.get('/api/data', async (c) => {
       }
       return m
     }
-    const map30    = sumStats(statsRaw30)
-    const mapMonth = sumStats(statsRawMonth)
+
+    let map30: Record<string, any> = {}
+    let mapMonth: Record<string, any> = {}
+
+    if (!lite) {
+      // 캐시 있으면 즉시, 없으면 API 호출 (TTL 3h)
+      const since30    = new Date(Date.now() - 30 * 86400000).toISOString().slice(0,10)
+      const monthStart = today.slice(0,7) + '-01'
+      const statsHit30    = cache['__stats30__']    && Date.now() - cache['__stats30__'].ts    < TTL_3H
+      const statsHitMonth = cache['__statsMonth__'] && Date.now() - cache['__statsMonth__'].ts < TTL_3H
+
+      if (statsHit30 && statsHitMonth) {
+        // 캐시 있음 — API 호출 없음
+        map30    = sumStats(cache['__stats30__'].data    as any[])
+        mapMonth = sumStats(cache['__statsMonth__'].data as any[])
+      } else {
+        // 캐시 없음 — 병렬로 한 번만 호출
+        const [r30, rM] = await Promise.all([
+          nStatsKw(ids, since30,    today, '__stats30__',    TTL_3H) as Promise<any[]>,
+          nStatsKw(ids, monthStart, today, '__statsMonth__', TTL_3H) as Promise<any[]>,
+        ])
+        map30    = sumStats(r30)
+        mapMonth = sumStats(rM)
+      }
+    }
 
     const keywords = activeKw.map((k: any) => {
       const s30 = map30[k.nccKeywordId]    || { imp:0, clk:0, cost:0 }
@@ -192,30 +207,22 @@ app.get('/api/data', async (c) => {
     const totalUsed30    = keywords.reduce((s: number, k: any) => s + k.cost, 0)
     const todayUsed      = Number(mainCamp?.totalChargeCost || 0)
     const todayRemain    = Math.max(0, dailyBudget - todayUsed)
-
     const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))]
 
     return c.json({
-      ok: true, isOn,
+      ok: true, isOn, lite,
       camp: mainCamp ? {
-        name:            mainCamp.name,
-        status:          mainCamp.status,
-        dailyBudget,
-        totalChargeCost: mainCamp.totalChargeCost || 0,
+        name: mainCamp.name, status: mainCamp.status,
+        dailyBudget, totalChargeCost: mainCamp.totalChargeCost || 0,
       } : null,
       budget: {
-        daily:        dailyBudget,
-        todayUsed,
-        todayRemain,
-        monthUsed:    totalUsedMonth,
-        total30Used:  totalUsed30,
-        monthLabel:   today.slice(0,7),
+        daily: dailyBudget, todayUsed, todayRemain,
+        monthUsed: totalUsedMonth, total30Used: totalUsed30,
+        monthLabel: today.slice(0,7),
       },
-      keywords,
-      agIds,      // 트렌드/어제 실적 API용
-      regions: REGIONS,
+      keywords, agIds, regions: REGIONS,
       cachedAt: new Date().toISOString(),
-      statsTtlMin: Math.round(TTL_STATS / 60000),  // 캐시 TTL 분 단위 표시용
+      statsTtlMin: Math.round(TTL_3H / 60000),
     })
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
@@ -809,20 +816,40 @@ let trendChart = null
 
 // ────────────────────────── 초기 로드 ──────────────────────────
 async function init() {
+  const loadingEl = document.getElementById('loading')
+  const slowTimer = setTimeout(() => {
+    loadingEl.querySelector('p').textContent = '네이버 API 응답 대기 중... (첫 로드는 10~20초 소요)'
+  }, 5000)
+
   try {
-    const r = await fetch('/api/data')
-    D = await r.json()
+    // ── 1단계: lite=1 로 빠르게 (캠페인+키워드+입찰가, stats 스킵)
+    const r1 = await fetch('/api/data?lite=1')
+    D = await r1.json()
+    clearTimeout(slowTimer)
     if (!D.ok) throw new Error(D.error)
     render()
     loadHistory()
+    loadingEl.style.display = 'none'
+    // 어제 실적은 비동기 병렬 (블로킹 안 함)
+    loadYesterday()
+
+    // ── 2단계: 백그라운드에서 stats 채워서 재렌더 (30일·이번달 실적)
+    fetch('/api/data').then(r2 => r2.json()).then(d2 => {
+      if (d2.ok) {
+        D = d2
+        render()  // 실적 컬럼 업데이트
+      }
+    }).catch(() => {/* 2단계 실패해도 1단계 렌더는 유지 */})
+
   } catch(e) {
-    document.getElementById('loading').innerHTML =
-      '<div style="color:#ef4444;font-size:13px"><i class="fas fa-exclamation-circle"></i> ' + e.message + '</div>'
+    clearTimeout(slowTimer)
+    loadingEl.innerHTML =
+      '<div style="color:#ef4444;font-size:13px;text-align:center">' +
+      '<i class="fas fa-exclamation-circle" style="margin-bottom:8px;display:block;font-size:24px"></i>' +
+      e.message + '<br><button onclick="location.reload()" style="margin-top:12px;padding:6px 16px;background:#03C75A;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">다시 시도</button>' +
+      '</div>'
     return
   }
-  document.getElementById('loading').style.display = 'none'
-  // 어제 실적은 비동기로 따로 로드 (메인 로드 블로킹 안 함)
-  loadYesterday()
 }
 
 async function hardRefresh() {
@@ -919,7 +946,7 @@ function renderYesterday() {
     tbl += '</tr></thead><tbody>'
     for (const k of kws) {
       // 노출 비율 바 (최대 기준)
-      const maxImp = Math.max(...kws.map((x:any) => x.imp), 1)
+      const maxImp = Math.max(...kws.map(x => x.imp), 1)
       const pct = Math.round(k.imp / maxImp * 100)
       tbl += '<tr style="border-bottom:1px solid #f0fdf4">'
       tbl += '<td style="padding:6px 8px;font-weight:600;color:#1f2937">' + k.keyword + '</td>'
