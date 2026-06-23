@@ -975,10 +975,13 @@ async function init() {
   try {
     // ── 1단계: lite=1 로 빠르게 (캠페인+키워드+입찰가, stats 스킵)
     const r1 = await fetch('/api/data?lite=1')
+    if (!r1.ok) throw new Error('API 응답 오류: ' + r1.status)
     D = await r1.json()
     clearTimeout(slowTimer)
-    if (!D.ok) throw new Error(D.error)
+    if (!D.ok) throw new Error(D.error || 'API 오류')
+    console.log('[init] 데이터 로드 완료, render() 호출')
     render()
+    console.log('[init] render() 완료')
     loadHistory()
     loadingEl.style.display = 'none'
     // 어제 실적은 비동기 병렬 (블로킹 안 함)
@@ -995,10 +998,11 @@ async function init() {
 
   } catch(e) {
     clearTimeout(slowTimer)
+    console.error('[init] 에러:', e)
     loadingEl.innerHTML =
       '<div style="color:#ef4444;font-size:13px;text-align:center">' +
       '<i class="fas fa-exclamation-circle" style="margin-bottom:8px;display:block;font-size:24px"></i>' +
-      e.message + '<br><button onclick="location.reload()" style="margin-top:12px;padding:6px 16px;background:#03C75A;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">다시 시도</button>' +
+      (e.message || String(e)) + '<br><button onclick="location.reload()" style="margin-top:12px;padding:6px 16px;background:#03C75A;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px">다시 시도</button>' +
       '</div>'
     return
   }
@@ -1337,7 +1341,7 @@ function applySort() {
     return '<tr data-id="' + k.id + '" data-ag="' + k.agId + '" data-bid="' + k.bidAmt + '" data-kw="' + k.keyword.replace(/"/g,'&quot;') + '">' +
       '<td style="color:var(--gray-400);font-size:11px">' + (i+1) + '</td>' +
       '<td class="kw-name-cell"><span class="kw-name">' + k.keyword + '</span>' +
-        '<button class="btn-red-sm" style="margin-left:auto" onclick="quickEdit(this.closest(\'tr\'))">수정</button>' +
+        '<button class="btn-red-sm" style="margin-left:auto" onclick="quickEdit(this.closest(&quot;tr&quot;))">수정</button>' +
       '</td>' +
       '<td class="r" data-label="입찰가"><span class="bid-val">' + k.bidAmt.toLocaleString() + '원</span></td>' +
       '<td class="r" data-label="상태">' + statusBadge + '</td>' +
@@ -1346,7 +1350,7 @@ function applySort() {
       '<td class="r" data-label="CTR">'  + ctr  + '</td>' +
       '<td class="r" data-label="비용">'  + cost + '</td>' +
       '<td class="r" data-label="CPC">'   + cpc  + '</td>' +
-      '<td class="r desktop-only"><button class="btn-red-sm" onclick="quickEdit(this.closest(\'tr\'))">수정</button></td>' +
+      '<td class="r desktop-only"><button class="btn-red-sm" onclick="quickEdit(this.closest(&quot;tr&quot;))">수정</button></td>' +
     '</tr>'
   }).join('')
 }
@@ -1395,8 +1399,8 @@ function renderRegions() {
 }
 
 // ────────────────────────── 입찰가 수정 ──────────────────────────
-function quickEdit(tr) {
-  const id = tr.dataset.id
+function quickEdit(rowEl) {
+  const id = rowEl.dataset.id
   const isMobile = window.innerWidth <= 480
 
   if (isMobile) {
