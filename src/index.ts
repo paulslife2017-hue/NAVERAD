@@ -854,6 +854,7 @@ async function init() {
       if (d2.ok) {
         D = d2
         render()  // 실적 컬럼 업데이트
+        if (YD) renderYesterday()  // 어제 실적 입찰가도 최신 D로 갱신
       }
     }).catch(() => {/* 2단계 실패해도 1단계 렌더는 유지 */})
 
@@ -877,6 +878,7 @@ async function hardRefresh() {
   D = await r.json()
   render()
   loadHistory()
+  if (YD) renderYesterday()  // 어제 실적 입찰가도 최신값으로 갱신
   ic.classList.remove('fa-spin')
   toast('입찰가·상태를 새로 불러옴. 실적은 ' + (D.statsTtlMin||60) + '분 캐시 유지', 'ok')
 }
