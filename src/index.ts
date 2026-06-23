@@ -188,6 +188,7 @@ app.get('/api/data', async (c) => {
       const sm  = mapMonth[k.nccKeywordId] || { imp:0, clk:0, cost:0 }
       const ctr  = s30.imp > 0 ? +(s30.clk / s30.imp * 100).toFixed(1) : 0
       const acpc = s30.clk > 0 ? Math.round(s30.cost / s30.clk) : 0
+      const qi   = k.nccQi || {}
       return {
         id:        k.nccKeywordId,
         agId:      k.nccAdgroupId,
@@ -200,6 +201,9 @@ app.get('/api/data', async (c) => {
         costMonth: sm.cost,
         ctr,
         acpc,
+        qiGrade:   qi.qiGrade   ?? null,   // 품질등급 1~10
+        adRel:     k.adRelevanceScore  ?? null,  // 광고관련도
+        expCtr:    k.expectedClickScore ?? null,  // 예상CTR점수
       }
     })
 
@@ -811,6 +815,9 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
                 <th>키워드</th>
                 <th class="r">입찰가</th>
                 <th class="r">상태</th>
+                <th class="r desktop-only" title="품질등급 (1~10, 높을수록 좋음)">품질</th>
+                <th class="r desktop-only" title="광고관련도 점수">관련도</th>
+                <th class="r desktop-only" title="예상 클릭률 점수">예상CTR</th>
                 <th class="r">노출</th>
                 <th class="r">클릭</th>
                 <th class="r">CTR</th>
@@ -820,7 +827,7 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
               </tr>
             </thead>
             <tbody id="kw-body">
-              <tr><td colspan="10" style="text-align:center;padding:40px;color:var(--gray-300)">
+              <tr><td colspan="13" style="text-align:center;padding:40px;color:var(--gray-300)">
                 <div class="spinner" style="margin:0 auto 8px"></div>
               </td></tr>
             </tbody>
@@ -1338,6 +1345,16 @@ function applySort() {
       : '<span class="no-data">—</span>'
     const cpc  = hasData && k.acpc > 0 ? fmt(k.acpc) + '원'                  : '<span class="no-data">—</span>'
 
+    // 품질지수 셀 렌더링
+    const qiColors = ['','#ef4444','#f97316','#f59e0b','#eab308','#84cc16','#22c55e','#10b981','#06b6d4','#3b82f6','#8b5cf6']
+    const qiGrade  = k.qiGrade != null ? k.qiGrade : null
+    const qiCell   = qiGrade != null
+      ? '<span style="display:inline-flex;align-items:center;gap:3px;font-weight:700;color:' + (qiColors[qiGrade]||'#6b7280') + '">' +
+        '<span style="font-size:15px">★</span>' + qiGrade + '</span>'
+      : '<span class="no-data">—</span>'
+    const relCell  = k.adRel  != null ? '<span style="font-size:12px;color:#6b7280">' + k.adRel  + '</span>' : '<span class="no-data">—</span>'
+    const expCell  = k.expCtr != null ? '<span style="font-size:12px;color:#6b7280">' + k.expCtr + '</span>' : '<span class="no-data">—</span>'
+
     return '<tr data-id="' + k.id + '" data-ag="' + k.agId + '" data-bid="' + k.bidAmt + '" data-kw="' + k.keyword.replace(/"/g,'&quot;') + '">' +
       '<td style="color:var(--gray-400);font-size:11px">' + (i+1) + '</td>' +
       '<td class="kw-name-cell"><span class="kw-name">' + k.keyword + '</span>' +
@@ -1345,6 +1362,9 @@ function applySort() {
       '</td>' +
       '<td class="r" data-label="입찰가"><span class="bid-val">' + k.bidAmt.toLocaleString() + '원</span></td>' +
       '<td class="r" data-label="상태">' + statusBadge + '</td>' +
+      '<td class="r desktop-only">' + qiCell  + '</td>' +
+      '<td class="r desktop-only">' + relCell + '</td>' +
+      '<td class="r desktop-only">' + expCell + '</td>' +
       '<td class="r" data-label="노출">' + imp  + '</td>' +
       '<td class="r" data-label="클릭">' + clk  + '</td>' +
       '<td class="r" data-label="CTR">'  + ctr  + '</td>' +
