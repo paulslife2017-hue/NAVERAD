@@ -324,11 +324,26 @@ app.get('/api/yesterday', async (c) => {
 
 app.post('/api/bid', async (c) => {
   try {
-    const { nccKeywordId, nccAdgroupId, bidAmt } = await c.req.json()
+    const { nccKeywordId, nccAdgroupId, bidAmt, keyword, oldBid } = await c.req.json()
     const r = await nPut(
       `/ncc/keywords/${nccKeywordId}?fields=nccAdgroupId,useGroupBidAmt,bidAmt`,
       { nccAdgroupId, useGroupBidAmt: false, bidAmt }
     )
+    // 입찰가 변경 이력 자동 저장
+    if (keyword && oldBid !== undefined) {
+      const entry: BidHistoryEntry = {
+        keyword,
+        oldBid: Number(oldBid),
+        newBid: Number(bidAmt),
+        reason: '수동 변경',
+        changedAt: new Date().toISOString(),
+      }
+      const today = new Date().toISOString().slice(0, 10)
+      bidChangeHistory = [
+        ...bidChangeHistory.filter(h => h.changedAt.slice(0, 10) === today),
+        entry,
+      ].slice(-100)
+    }
     return c.json({ ok:true, result: r })
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
@@ -366,6 +381,7 @@ app.get('/api/history', async (c) => {
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
 
+// scheduler.py → POST /api/history-write (자동 입찰가 조정 이력)
 app.post('/api/history-write', async (c) => {
   try {
     const body = await c.req.json() as {
@@ -373,17 +389,17 @@ app.post('/api/history-write', async (c) => {
     }
     const entry: BidHistoryEntry = {
       keyword:   body.keyword,
-      oldBid:    body.oldBid,
-      newBid:    body.newBid,
-      reason:    body.reason,
+      oldBid:    Number(body.oldBid),
+      newBid:    Number(body.newBid),
+      reason:    body.reason || '',
       changedAt: body.changedAt || new Date().toISOString(),
     }
-    const today = new Date().toISOString().slice(0, 10)
+    const today = new Date(Date.now() + 9*3600*1000).toISOString().slice(0, 10) // KST 기준
     bidChangeHistory = [
-      ...bidChangeHistory.filter(h => h.changedAt.slice(0, 10) === today),
+      ...bidChangeHistory.filter(h => h.changedAt.slice(0, 10) >= today.slice(0,10).replace(/./g, (c,i) => i < 8 ? c : String.fromCharCode(c.charCodeAt(0)-1)) || true),
       entry,
-    ].slice(-50)
-    return c.json({ ok: true })
+    ].slice(-200) // 최대 200개 보관
+    return c.json({ ok: true, total: bidChangeHistory.length })
   } catch(e: any) { return c.json({ ok:false, error: e.message }, 500) }
 })
 
@@ -941,16 +957,21 @@ function renderYesterday() {
     tbl += '<table style="width:100%;border-collapse:collapse;font-size:12px">'
     tbl += '<thead><tr style="background:#f0fdf4">'
     tbl += '<th style="padding:5px 8px;text-align:left;color:#6b7280;font-weight:600;font-size:11px">키워드</th>'
-    tbl += '<th style="padding:5px 8px;text-align:right;color:#6b7280;font-weight:600;font-size:11px">입찰가</th>'
+    tbl += '<th style="padding:5px 8px;text-align:right;color:#6b7280;font-weight:600;font-size:11px">입찰가(현재)</th>'
     tbl += '<th style="padding:5px 8px;text-align:right;color:#6b7280;font-weight:600;font-size:11px">노출</th>'
     tbl += '</tr></thead><tbody>'
+    // D.keywords 에서 최신 입찰가 맵 생성
+    const liveBidMap = {}
+    if (D && D.keywords) D.keywords.forEach(k => { liveBidMap[k.keyword] = k.bidAmt })
     for (const k of kws) {
       // 노출 비율 바 (최대 기준)
       const maxImp = Math.max(...kws.map(x => x.imp), 1)
       const pct = Math.round(k.imp / maxImp * 100)
+      // 최신 입찰가 우선 (D.keywords), 없으면 stats에 담긴 값
+      const liveBid = liveBidMap[k.keyword] ?? k.bidAmt
       tbl += '<tr style="border-bottom:1px solid #f0fdf4">'
       tbl += '<td style="padding:6px 8px;font-weight:600;color:#1f2937">' + k.keyword + '</td>'
-      tbl += '<td style="padding:6px 8px;text-align:right;color:#2563eb;white-space:nowrap">' + fmt(k.bidAmt) + '원</td>'
+      tbl += '<td style="padding:6px 8px;text-align:right;color:#2563eb;white-space:nowrap;font-weight:700">' + fmt(liveBid) + '원</td>'
       tbl += '<td style="padding:6px 8px;min-width:100px">'
         + '<div style="display:flex;align-items:center;gap:5px;justify-content:flex-end">'
         + '<div style="flex:1;max-width:60px;height:5px;background:#e5e7eb;border-radius:3px;overflow:hidden">'
@@ -1242,13 +1263,21 @@ async function applyBid() {
   const val = parseInt(document.getElementById('bid-val').value)
   if (!val || val < 70) { toast('최소 70원 이상 입력하세요', 'err'); return }
   const rounded = Math.round(val / 10) * 10
+  const kwName  = opt.text.split(' —')[0]
+  const oldBid  = parseInt(opt.dataset.bid || '0')
 
   toast('입찰가 적용 중...', 'info')
   try {
     const r = await fetch('/api/bid', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ nccKeywordId: opt.value, nccAdgroupId: opt.dataset.ag, bidAmt: rounded })
+      body: JSON.stringify({
+        nccKeywordId: opt.value,
+        nccAdgroupId: opt.dataset.ag,
+        bidAmt: rounded,
+        keyword: kwName,
+        oldBid: oldBid
+      })
     })
     const d = await r.json()
     if (!d.ok) throw new Error(d.error)
@@ -1261,39 +1290,87 @@ async function applyBid() {
       opt.text = kw.keyword + ' — ' + rounded.toLocaleString() + '원'
     }
     document.getElementById('cur-bid-val').textContent = rounded.toLocaleString()
+
+    // localStorage에 이력 저장 (서버 재시작해도 유지)
+    saveLocalHistory({ keyword: kwName, oldBid, newBid: rounded, reason: '수동 변경', changedAt: new Date().toISOString() })
+
     renderTable()
-    toast('✅ ' + opt.text.split(' —')[0] + ' → ' + rounded.toLocaleString() + '원 적용', 'ok')
+    loadHistory()
+    toast('✅ ' + kwName + ' → ' + rounded.toLocaleString() + '원 적용', 'ok')
   } catch(e) {
     toast('❌ 실패: ' + e.message, 'err')
   }
 }
 
-// ────────────────────────── 이력 ──────────────────────────
+// ────────────── 이력 (서버 자동조정 + localStorage 수동변경 통합) ──────────────
+
+// localStorage 저장: KST 날짜별, 최대 3일 보관
+function saveLocalHistory(entry) {
+  try {
+    const today = new Date(Date.now() + 9*3600*1000).toISOString().slice(0,10)
+    const key = 'bid_hist_' + today
+    const arr = JSON.parse(localStorage.getItem(key) || '[]')
+    arr.push(entry)
+    localStorage.setItem(key, JSON.stringify(arr.slice(-100)))
+    for (let i = 4; i <= 30; i++) {
+      const old = new Date(Date.now() + 9*3600*1000 - i*86400000).toISOString().slice(0,10)
+      localStorage.removeItem('bid_hist_' + old)
+    }
+  } catch(e) {}
+}
+
+function getLocalHistory() {
+  try {
+    return [0,1,2].flatMap(i => {
+      const d = new Date(Date.now() + 9*3600*1000 - i*86400000).toISOString().slice(0,10)
+      return JSON.parse(localStorage.getItem('bid_hist_' + d) || '[]')
+    })
+  } catch(e) { return [] }
+}
+
 async function loadHistory() {
   try {
+    // 서버 이력 (자동 스케줄러 변경분)
     const r = await fetch('/api/history')
     const d = await r.json()
+    const serverHist = (d.ok && d.history) ? d.history : []
+
+    // localStorage 이력 (수동 변경분, Vercel 재시작 후에도 유지)
+    const localHist = getLocalHistory()
+
+    // 통합 + 중복 제거 (keyword+changedAt 기준) + 최신순 정렬
+    const seen = new Set()
+    const merged = [...serverHist, ...localHist]
+      .filter(h => { const k = h.keyword + h.changedAt; if (seen.has(k)) return false; seen.add(k); return true })
+      .sort((a,b) => a.changedAt > b.changedAt ? -1 : 1)
+
     const list = document.getElementById('hist-list')
-    if (!d.history || !d.history.length) {
-      list.innerHTML = '<div style="text-align:center;padding:16px 0;color:var(--gray-300);font-size:12px"><i class="fas fa-inbox" style="margin-right:4px"></i>오늘 변경 이력 없음</div>'
+    if (!merged.length) {
+      list.innerHTML = '<div style="text-align:center;padding:16px 0;color:var(--gray-300);font-size:12px"><i class="fas fa-inbox" style="margin-right:4px"></i>변경 이력 없음</div>'
       return
     }
-    const sorted = [...d.history].reverse()
-    list.innerHTML = sorted.map(h => {
-      const arrow = h.newBid > h.oldBid
-        ? '<span class="up-arrow">▲</span>'
-        : '<span class="down-arrow">▼</span>'
-      const diff = Math.abs(h.newBid - h.oldBid)
-      const time = h.changedAt ? h.changedAt.slice(11,16) : ''
-      const reasonShort = (h.reason||'').replace(/→입찰가/g,'').replace(/\\(.*?\\)/g,'').slice(0,20)
+
+    list.innerHTML = merged.map(h => {
+      const isUp   = h.newBid > h.oldBid
+      const arrow  = isUp ? '<span class="up-arrow">▲</span>' : '<span class="down-arrow">▼</span>'
+      const diff   = Math.abs(h.newBid - h.oldBid)
+      const dtKst  = h.changedAt ? new Date(new Date(h.changedAt).getTime() + 9*3600*1000) : null
+      const timeStr = dtKst ? dtKst.toISOString().slice(11,16) : ''
+      const dateStr = dtKst ? dtKst.toISOString().slice(5,10).replace('-','.') : ''
+      const reason  = (h.reason||'').slice(0,26)
+      const srcBadge = (h.reason === '수동 변경')
+        ? '<span style="font-size:9px;background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;border-radius:4px;padding:1px 5px;margin-left:4px">수동</span>'
+        : '<span style="font-size:9px;background:#f0fdf4;color:#059669;border:1px solid #a7f3d0;border-radius:4px;padding:1px 5px;margin-left:4px">자동</span>'
       return '<div class="hist-item">' +
-        '<div>' +
-          '<div class="hist-kw">' + arrow + ' ' + h.keyword + '</div>' +
-          '<div class="hist-bid">' + h.oldBid.toLocaleString() + '원 → <strong style="color:var(--green)">' + h.newBid.toLocaleString() + '원</strong>' +
-          ' <span style="font-size:10px;color:var(--gray-400)">(' + (h.newBid > h.oldBid ? '+' : '-') + diff.toLocaleString() + ')</span></div>' +
-          '<div style="font-size:10px;color:var(--gray-400);margin-top:2px">' + reasonShort + '</div>' +
+        '<div style="flex:1;min-width:0">' +
+          '<div class="hist-kw">' + arrow + ' ' + h.keyword + srcBadge + '</div>' +
+          '<div class="hist-bid">' + Number(h.oldBid).toLocaleString() + '원 → ' +
+            '<strong style="color:' + (isUp ? 'var(--green)' : 'var(--red)') + '">' + Number(h.newBid).toLocaleString() + '원</strong>' +
+            ' <span style="font-size:10px;color:var(--gray-400)">(' + (isUp?'+':'-') + diff.toLocaleString() + '원)</span>' +
+          '</div>' +
+          '<div style="font-size:10px;color:var(--gray-400);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + reason + '</div>' +
         '</div>' +
-        '<div class="hist-time">' + time + '</div>' +
+        '<div class="hist-time" style="white-space:nowrap;text-align:right;font-size:11px">' + dateStr + '<br><strong>' + timeStr + '</strong></div>' +
       '</div>'
     }).join('')
   } catch(e) {}
