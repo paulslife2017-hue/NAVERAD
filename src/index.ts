@@ -351,6 +351,9 @@ app.post('/api/bid', async (c) => {
 // /api/cache?type=ncc  → 입찰가·키워드·캠페인 캐시만 삭제 (새로고침용)
 // /api/cache?type=stats → stats 캐시만 삭제 (실적 강제갱신용)
 // /api/cache            → 전체 삭제
+// 스케줄러가 입찰가 변경 후 클리어할 때 타임스탬프 갱신
+let lastBidUpdate = Date.now()
+
 app.delete('/api/cache', (c) => {
   const type = c.req.query('type')
   let cnt = 0
@@ -361,6 +364,7 @@ app.delete('/api/cache', (c) => {
         delete cache[k]; cnt++
       }
     })
+    lastBidUpdate = Date.now()  // 스케줄러 입찰가 변경 시각 기록
   } else if (type === 'stats') {
     // stats만 — 입찰가는 그대로
     Object.keys(cache).forEach(k => {
@@ -373,6 +377,11 @@ app.delete('/api/cache', (c) => {
     Object.keys(cache).forEach(k => delete cache[k])
   }
   return c.json({ ok:true, cleared: cnt, type: type || 'all' })
+})
+
+// 프론트 폴링용: 마지막 입찰가 변경 시각 반환
+app.get('/api/ping', (c) => {
+  return c.json({ lastBidUpdate })
 })
 
 app.get('/api/history', async (c) => {
@@ -829,8 +838,36 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
 let D = null
 let YD = null
 let trendChart = null
+let _lastBidUpdate = 0  // 마지막으로 확인한 서버 입찰가 변경 시각
 
 // ────────────────────────── 초기 로드 ──────────────────────────
+// ────────────────────────── 자동 새로고침 폴링 ──────────────────────────
+// 30초마다 서버 lastBidUpdate 확인 → 변경 감지 시 자동으로 입찰가 재로드
+function startAutoRefresh() {
+  setInterval(async () => {
+    try {
+      const r = await fetch('/api/ping')
+      const { lastBidUpdate } = await r.json()
+      if (_lastBidUpdate === 0) {
+        _lastBidUpdate = lastBidUpdate  // 초기값 세팅
+        return
+      }
+      if (lastBidUpdate > _lastBidUpdate) {
+        _lastBidUpdate = lastBidUpdate
+        // 스케줄러가 입찰가 변경 → NCC 데이터 자동 재로드
+        const r2 = await fetch('/api/data?lite=1')
+        const d2 = await r2.json()
+        if (d2.ok) {
+          D = d2
+          render()
+          if (YD) renderYesterday()
+          toast('🔄 입찰가 자동 업데이트됨', 'ok')
+        }
+      }
+    } catch(e) { /* 폴링 실패는 조용히 무시 */ }
+  }, 30000)  // 30초마다
+}
+
 async function init() {
   const loadingEl = document.getElementById('loading')
   const slowTimer = setTimeout(() => {
@@ -867,6 +904,7 @@ async function init() {
       '</div>'
     return
   }
+  startAutoRefresh()  // 초기 로드 성공 후 자동 새로고침 폴링 시작
 }
 
 async function hardRefresh() {
