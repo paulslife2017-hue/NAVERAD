@@ -551,16 +551,99 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
 .chart-card{background:var(--white);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);margin-bottom:14px}
 .chart-wrap{padding:14px 18px 8px;position:relative;height:200px}
 
+/* 데스크탑 전용 (모바일에서 숨김) */
+.desktop-only{display:table-cell}
+@media(max-width:480px){.desktop-only{display:none!important}}
+
 /* 반응형 */
 @media(max-width:900px){
   .kpi-grid{grid-template-columns:repeat(2,1fr)}
   .main-grid{grid-template-columns:1fr!important}
   .yest-stats{grid-template-columns:repeat(3,1fr)}
 }
-@media(max-width:600px){
-  .kpi-grid{grid-template-columns:1fr 1fr}
-  .wrap{padding:12px}
-  .yest-stats{grid-template-columns:repeat(2,1fr)}
+
+/* ── 모바일 (480px 이하) ── */
+@media(max-width:480px){
+  body{font-size:13px}
+  .wrap{padding:8px 10px;padding-bottom:80px} /* 하단 고정바 공간 */
+  .nav-inner{padding:0 12px;height:48px}
+  .nav-logo .logo-sub{display:none}
+  .kpi-grid{grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:10px}
+  .kpi{padding:12px 14px}
+  .kpi-val{font-size:20px}
+  /* 어제실적 */
+  .yest-card{padding:12px 14px}
+  .yest-stats{grid-template-columns:repeat(3,1fr);gap:8px}
+  .yest-stat-val{font-size:16px}
+  /* 트렌드 차트 */
+  .chart-wrap{height:160px}
+  /* 예산 숫자 줄바꿈 허용 */
+  .budget-nums{flex-wrap:wrap;gap:8px!important}
+  .budget-nums>div{min-width:calc(50% - 8px)}
+  /* 테이블 → 카드형 */
+  .tbl-wrap table,
+  .tbl-wrap thead,
+  .tbl-wrap tbody,
+  .tbl-wrap th,
+  .tbl-wrap td,
+  .tbl-wrap tr{display:block}
+  .tbl-wrap thead{display:none}
+  .tbl-wrap tbody tr{
+    background:var(--white);
+    border:1px solid var(--gray-200);
+    border-radius:10px;
+    margin-bottom:8px;
+    padding:10px 12px;
+    position:relative;
+  }
+  .tbl-wrap tbody tr:hover{background:var(--white)}
+  .tbl-wrap td{
+    border:none;
+    padding:2px 0;
+    text-align:left!important;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    font-size:12px;
+  }
+  .tbl-wrap td::before{
+    content:attr(data-label);
+    font-size:11px;
+    color:var(--gray-400);
+    font-weight:500;
+    min-width:52px;
+    flex-shrink:0;
+  }
+  .tbl-wrap td:first-child{display:none} /* # 숫자 숨김 */
+  .tbl-wrap td.kw-name-cell{
+    font-size:14px;
+    font-weight:700;
+    color:var(--gray-800);
+    justify-content:flex-start;
+    padding-bottom:6px;
+    border-bottom:1px solid var(--gray-100);
+    margin-bottom:4px;
+  }
+  .tbl-wrap td.kw-name-cell::before{display:none}
+  /* 오른쪽 패널 전체 숨김 (모바일엔 하단바로 대체) */
+  .right-panel{display:none}
+  /* 하단 고정 입찰가 수정바 */
+  #mobile-bid-bar{
+    display:flex!important;
+    position:fixed;
+    bottom:0;left:0;right:0;
+    background:var(--white);
+    border-top:1px solid var(--border);
+    box-shadow:0 -2px 12px rgba(0,0,0,.10);
+    padding:10px 12px;
+    gap:8px;
+    align-items:center;
+    z-index:200;
+  }
+  #toast{bottom:80px;right:12px;left:12px;text-align:center}
+  .yest-header{flex-wrap:wrap;gap:6px}
+  .card-header{padding:12px 14px}
+  .card-body{padding:12px 14px}
 }
 </style>
 </head>
@@ -654,7 +737,7 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
         <span style="font-size:13px;font-weight:700;color:var(--gray-800)">
           <i class="fas fa-wallet" style="color:var(--yellow);margin-right:6px"></i>예산 현황
         </span>
-        <div style="display:flex;gap:24px;flex-wrap:wrap">
+        <div class="budget-nums" style="display:flex;gap:24px;flex-wrap:wrap">
           <div>
             <div style="font-size:10px;color:var(--gray-400);margin-bottom:2px">일예산</div>
             <div id="b-daily" style="font-size:15px;font-weight:700;color:var(--gray-800)">—</div>
@@ -743,7 +826,7 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
     </div>
 
     <!-- 오른쪽 패널 -->
-    <div style="display:flex;flex-direction:column;gap:12px">
+    <div class="right-panel" style="display:flex;flex-direction:column;gap:12px">
 
       <!-- 입찰가 수정 -->
       <div class="card">
@@ -833,6 +916,17 @@ select:focus,input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(3,1
     </div><!-- /right -->
   </div><!-- /main-grid -->
 </div><!-- /wrap -->
+
+<!-- 모바일 하단 고정 입찰가 수정바 (480px 이하에서만 표시) -->
+<div id="mobile-bid-bar" style="display:none">
+  <select id="mbid-sel" style="flex:1;min-width:0;font-size:13px;border:1px solid var(--gray-200);border-radius:8px;padding:8px 10px;color:var(--gray-700);background:var(--white)">
+    <option value="">키워드 선택...</option>
+  </select>
+  <input id="mbid-val" type="number" min="70" step="10" placeholder="입찰가" style="width:90px;font-size:13px;border:1px solid var(--gray-200);border-radius:8px;padding:8px 10px;color:var(--gray-700)"/>
+  <button onclick="applyMobileBid()" style="background:var(--green);color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:700;white-space:nowrap;cursor:pointer">
+    <i class="fas fa-check"></i>
+  </button>
+</div>
 
 <script>
 let D = null
@@ -1238,27 +1332,32 @@ function applySort() {
 
     return '<tr data-id="' + k.id + '" data-ag="' + k.agId + '" data-bid="' + k.bidAmt + '" data-kw="' + k.keyword.replace(/"/g,'&quot;') + '">' +
       '<td style="color:var(--gray-400);font-size:11px">' + (i+1) + '</td>' +
-      '<td><span class="kw-name">' + k.keyword + '</span></td>' +
-      '<td class="r"><span class="bid-val">' + k.bidAmt.toLocaleString() + '원</span></td>' +
-      '<td class="r">' + statusBadge + '</td>' +
-      '<td class="r">' + imp  + '</td>' +
-      '<td class="r">' + clk  + '</td>' +
-      '<td class="r">' + ctr  + '</td>' +
-      '<td class="r">' + cost + '</td>' +
-      '<td class="r">' + cpc  + '</td>' +
-      '<td class="r"><button class="btn-red-sm" onclick="quickEdit(this.parentElement.parentElement)">수정</button></td>' +
+      '<td class="kw-name-cell"><span class="kw-name">' + k.keyword + '</span>' +
+        '<button class="btn-red-sm" style="margin-left:auto" onclick="quickEdit(this.closest(\'tr\'))">수정</button>' +
+      '</td>' +
+      '<td class="r" data-label="입찰가"><span class="bid-val">' + k.bidAmt.toLocaleString() + '원</span></td>' +
+      '<td class="r" data-label="상태">' + statusBadge + '</td>' +
+      '<td class="r" data-label="노출">' + imp  + '</td>' +
+      '<td class="r" data-label="클릭">' + clk  + '</td>' +
+      '<td class="r" data-label="CTR">'  + ctr  + '</td>' +
+      '<td class="r" data-label="비용">'  + cost + '</td>' +
+      '<td class="r" data-label="CPC">'   + cpc  + '</td>' +
+      '<td class="r desktop-only"><button class="btn-red-sm" onclick="quickEdit(this.closest(\'tr\'))">수정</button></td>' +
     '</tr>'
   }).join('')
 }
 
 function renderBidSelect() {
-  const sel = document.getElementById('bid-sel')
   const kws = [...(D.keywords || [])].sort((a,b) => a.keyword.localeCompare(b.keyword))
-  sel.innerHTML = '<option value="">키워드를 선택하세요...</option>' +
+  const opts = '<option value="">키워드 선택...</option>' +
     kws.map(k =>
       '<option value="' + k.id + '" data-ag="' + k.agId + '" data-bid="' + k.bidAmt + '">'
       + k.keyword + ' — ' + k.bidAmt.toLocaleString() + '원</option>'
     ).join('')
+
+  // 데스크탑 셀렉트
+  const sel = document.getElementById('bid-sel')
+  sel.innerHTML = opts
   sel.onchange = () => {
     const opt = sel.options[sel.selectedIndex]
     const info = document.getElementById('cur-bid-info')
@@ -1266,8 +1365,18 @@ function renderBidSelect() {
       document.getElementById('cur-bid-val').textContent = Number(opt.dataset.bid).toLocaleString()
       document.getElementById('bid-val').value = opt.dataset.bid
       info.style.display = 'block'
-    } else {
-      info.style.display = 'none'
+    } else { info.style.display = 'none' }
+  }
+
+  // 모바일 하단바 셀렉트 동기화
+  const msel = document.getElementById('mbid-sel')
+  if (msel) {
+    msel.innerHTML = opts
+    msel.onchange = () => {
+      const opt = msel.options[msel.selectedIndex]
+      const mval = document.getElementById('mbid-val')
+      if (opt.value) mval.value = opt.dataset.bid
+      else mval.value = ''
     }
   }
 }
@@ -1284,14 +1393,66 @@ function renderRegions() {
 // ────────────────────────── 입찰가 수정 ──────────────────────────
 function quickEdit(tr) {
   const id = tr.dataset.id
-  const sel = document.getElementById('bid-sel')
-  for (let i = 0; i < sel.options.length; i++) {
-    if (sel.options[i].value === id) {
-      sel.selectedIndex = i
-      sel.dispatchEvent(new Event('change'))
-      document.querySelector('.card-body select')?.closest('.card')?.scrollIntoView({ behavior:'smooth', block:'start' })
-      break
+  const isMobile = window.innerWidth <= 480
+
+  if (isMobile) {
+    // 모바일: 하단 바 셀렉트에서 해당 키워드 선택 + 입찰가 채우기
+    const msel = document.getElementById('mbid-sel')
+    const mval = document.getElementById('mbid-val')
+    for (let i = 0; i < msel.options.length; i++) {
+      if (msel.options[i].value === id) {
+        msel.selectedIndex = i
+        mval.value = msel.options[i].dataset.bid
+        mval.focus()
+        break
+      }
     }
+  } else {
+    // 데스크탑: 기존 방식
+    const sel = document.getElementById('bid-sel')
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === id) {
+        sel.selectedIndex = i
+        sel.dispatchEvent(new Event('change'))
+        document.querySelector('.card-body select')?.closest('.card')?.scrollIntoView({ behavior:'smooth', block:'start' })
+        break
+      }
+    }
+  }
+}
+
+// 모바일 하단바 입찰가 적용
+async function applyMobileBid() {
+  const msel = document.getElementById('mbid-sel')
+  const mval = document.getElementById('mbid-val')
+  const opt  = msel.options[msel.selectedIndex]
+  if (!opt.value) { toast('키워드를 선택하세요', 'err'); return }
+  const val = parseInt(mval.value)
+  if (!val || val < 70) { toast('최소 70원 이상 입력하세요', 'err'); return }
+  const rounded = Math.round(val / 10) * 10
+  const kwName  = opt.text.split(' —')[0]
+  const oldBid  = parseInt(opt.dataset.bid || '0')
+
+  toast('입찰가 적용 중...', 'info')
+  try {
+    const r = await fetch('/api/bid', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ nccKeywordId: opt.value, nccAdgroupId: opt.dataset.ag, bidAmt: rounded, keyword: kwName, oldBid })
+    })
+    const d = await r.json()
+    if (!d.ok) throw new Error(d.error)
+    // D.keywords 업데이트
+    const kw = D.keywords.find(k => k.id === opt.value)
+    if (kw) kw.bidAmt = rounded
+    renderTable()
+    renderBidSelect()
+    saveLocalHistory({ keyword: kwName, oldBid, newBid: rounded, reason: '수동 변경', changedAt: new Date().toISOString() })
+    loadHistory()
+    mval.value = ''
+    toast('✅ ' + kwName + ' → ' + rounded.toLocaleString() + '원', 'ok')
+  } catch(e) {
+    toast('❌ 실패: ' + e.message, 'err')
   }
 }
 
