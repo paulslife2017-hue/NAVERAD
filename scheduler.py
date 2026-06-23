@@ -169,7 +169,9 @@ def api_put(uri, body, fields=""):
     return r.status_code, (r.json() if r.status_code == 200 else r.text[:200])
 
 # ── 대시보드 이력 기록 ─────────────────────────────────────────────────────
-DASHBOARD_URL = "http://localhost:3000"
+# Vercel 배포 후 실제 URL로 변경 필요
+# 예: DASHBOARD_URL = "https://your-project.vercel.app"
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://localhost:3000")
 
 def push_history(keyword, old_bid, new_bid, reason):
     try:
@@ -177,7 +179,7 @@ def push_history(keyword, old_bid, new_bid, reason):
             f"{DASHBOARD_URL}/api/history-write",
             json={"keyword": keyword, "oldBid": old_bid, "newBid": new_bid,
                   "reason": reason,
-                  "changedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                  "changedAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S+09:00")},
             timeout=3,
         )
     except Exception:
