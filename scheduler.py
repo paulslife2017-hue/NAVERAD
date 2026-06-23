@@ -185,6 +185,14 @@ def push_history(keyword, old_bid, new_bid, reason):
     except Exception:
         pass
 
+def clear_ncc_cache():
+    """입찰가 변경 후 대시보드 NCC 캐시 삭제 → 다음 조회 시 최신값 반영"""
+    try:
+        r = requests.delete(f"{DASHBOARD_URL}/api/cache?type=ncc", timeout=3)
+        log(f"  🗑 대시보드 캐시 클리어: {r.status_code}")
+    except Exception as e:
+        log(f"  ⚠ 캐시 클리어 실패 (무시): {e}")
+
 # ── DB 초기화 ─────────────────────────────────────────────────────────────
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -543,6 +551,8 @@ def do_check():
         time.sleep(0.2)
 
     log(f"▶ 점검 완료: 변경{ok}개↑↓ / 실패{fail}개 / 유지{len(all_kws)-len(to_change)}개 | 오늘{today_used:,}원/{DAILY_BUDGET:,}원")
+    if ok > 0:
+        clear_ncc_cache()  # 입찰가 변경 있을 때만 캐시 클리어
     return True
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -664,6 +674,8 @@ def do_check_place():
         return False
 
     log(f"▶ [플레이스] 점검 완료: {cur_bid}{tag}{new_bid}원 | 오늘 {today_used:,}원/{PLACE_DAILY_BUDGET:,}원")
+    if new_bid != cur_bid:
+        clear_ncc_cache()  # 입찰가 변경 시 캐시 클리어
     return True
 
 
