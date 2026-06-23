@@ -4,7 +4,7 @@ module.exports = {
     {
       name: 'naver-ad-dashboard',
       script: 'npx',
-      args: 'wrangler pages dev dist --ip 0.0.0.0 --port 3000',
+      args: 'wrangler pages dev dist --ip 0.0.0.0 --port 3000 --compatibility-date=2026-05-03',
       env: { NODE_ENV: 'development' },
       watch: false,
       instances: 1,

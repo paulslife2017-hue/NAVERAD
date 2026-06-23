@@ -12,11 +12,12 @@ const API = 'https://api.naver.com'
 
 // ── 캐시 — 크레딧 절약 최우선 ──────────────────────────────────────────────
 const cache: Record<string, { data: unknown; ts: number }> = {}
+const TTL_NCC   = 10 * 60 * 1000       // 키워드·입찰가: 10분 (Vercel 서버리스 대응)
 const TTL_1H    = 60 * 60 * 1000
-const TTL_12H   = 12 * 60 * 60 * 1000  // 키워드 목록/캠페인 (잘 안바뀜)
-const TTL_3H    =  3 * 60 * 60 * 1000  // 30일·이번달 stats (자주 볼 필요 없음)
-const TTL_2H    =  2 * 60 * 60 * 1000  // 어제 실적 (집계 완료 후 고정)
-const TTL_6H    =  6 * 60 * 60 * 1000  // 7일 트렌드 (어제까지 데이터, 거의 안바뀜)
+const TTL_12H   = 12 * 60 * 60 * 1000  // 캠페인 (거의 안바뀜)
+const TTL_3H    =  3 * 60 * 60 * 1000  // 30일·이번달 stats
+const TTL_2H    =  2 * 60 * 60 * 1000  // 어제 실적
+const TTL_6H    =  6 * 60 * 60 * 1000  // 7일 트렌드
 const TTL_STATS = TTL_2H               // 어제 단건 기본값
 
 // ── 입찰 변경 이력 (in-memory) ─────────────────────────────────────────
@@ -121,19 +122,22 @@ app.get('/api/data', async (c) => {
     const today = now.toISOString().slice(0,10)
 
     const [camps, adgroups] = await Promise.all([
-      nGet('/ncc/campaigns') as Promise<any[]>,
-      nGet('/ncc/adgroups')  as Promise<any[]>,
+      nGet('/ncc/campaigns', undefined, TTL_12H) as Promise<any[]>,
+      nGet('/ncc/adgroups',  undefined, TTL_NCC) as Promise<any[]>,
     ])
 
+    // PAUSED 그룹 제외 — 스케줄러도 PAUSED 그룹 스킵하므로 동일하게 처리
+    const activeAdgroups = adgroups.filter((ag: any) => ag.status !== 'PAUSED' && !ag.userLock)
     const kwBatch = await Promise.all(
-      adgroups.map((ag: any) =>
-        nGet('/ncc/keywords', { nccAdgroupId: ag.nccAdgroupId }).catch(() => []) as Promise<any[]>
+      activeAdgroups.map((ag: any) =>
+        nGet('/ncc/keywords', { nccAdgroupId: ag.nccAdgroupId }, TTL_NCC).catch(() => []) as Promise<any[]>
       )
     )
     const allKw: any[] = (kwBatch as any[][]).flat()
     const kwMap: Record<string, any> = {}
     for (const k of allKw) {
       const existing = kwMap[k.keyword]
+      // PAUSED 그룹 키워드는 건너뜀 (이미 activeAdgroups로 필터링됨)
       if (!existing || k.bidAmt > existing.bidAmt) kwMap[k.keyword] = k
     }
     const activeKw = Object.values(kwMap).filter((k: any) => !EXCLUDE.has(k.keyword))
@@ -207,7 +211,7 @@ app.get('/api/data', async (c) => {
     const totalUsed30    = keywords.reduce((s: number, k: any) => s + k.cost, 0)
     const todayUsed      = Number(mainCamp?.totalChargeCost || 0)
     const todayRemain    = Math.max(0, dailyBudget - todayUsed)
-    const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))]
+    const agIds = [...new Set(activeAdgroups.map((ag: any) => ag.nccAdgroupId))]
 
     return c.json({
       ok: true, isOn, lite,
@@ -231,15 +235,15 @@ app.get('/api/data', async (c) => {
 app.get('/api/yesterday', async (c) => {
   try {
     const [camps, adgroups] = await Promise.all([
-      nGet('/ncc/campaigns') as Promise<any[]>,
-      nGet('/ncc/adgroups')  as Promise<any[]>,
+      nGet('/ncc/campaigns', undefined, TTL_12H) as Promise<any[]>,
+      nGet('/ncc/adgroups',  undefined, TTL_NCC) as Promise<any[]>,
     ])
-    const agIds = [...new Set(adgroups.map((ag: any) => ag.nccAdgroupId))] as string[]
-
-    // 키워드 목록 (캐시 재활용 — ncc 캐시 12h, API 추가 없음)
+    // 키워드 목록 (TTL_NCC = 10분, 입찰가 변경 빠른 반영) — PAUSED 그룹 제외
+    const activeAdgroupsY = adgroups.filter((ag: any) => ag.status !== 'PAUSED' && !ag.userLock)
+    const agIds = [...new Set(activeAdgroupsY.map((ag: any) => ag.nccAdgroupId))] as string[]
     const kwBatch = await Promise.all(
-      adgroups.map((ag: any) =>
-        nGet('/ncc/keywords', { nccAdgroupId: ag.nccAdgroupId }).catch(() => []) as Promise<any[]>
+      activeAdgroupsY.map((ag: any) =>
+        nGet('/ncc/keywords', { nccAdgroupId: ag.nccAdgroupId }, TTL_NCC).catch(() => []) as Promise<any[]>
       )
     )
     const allKw: any[] = (kwBatch as any[][]).flat()
