@@ -20,12 +20,12 @@ DB_PATH = "/home/user/webapp/data/naver_ad.db"
 LOG_PATH = "/home/user/webapp/data/smart_bid.log"
 
 # ── 월 예산 설정 ─────────────────────────────────────────────────────────────
-MONTHLY_BUDGET = 500_000   # 월 50만원
-DAILY_BUDGET   = MONTHLY_BUDGET // 30  # 일 16,666원
+MONTHLY_BUDGET = 3_000_000   # 월 300만원 (일 10만원 × 30일)
+DAILY_BUDGET   = 100_000     # 일 10만원
 
 # ── 입찰가 상·하한 ─────────────────────────────────────────────────────────
 MIN_BID = 70     # 최소 입찰가 (네이버 정책)
-MAX_BID = 1000   # 최대 입찰가 (예산 초과 방지)
+MAX_BID = 5000   # 최대 입찰가 (1페이지 상단 경쟁 키워드 대응)
 
 # ── 청소 계열 (비용 절약 타겟 - 최저가 유지) ─────────────────────────────────
 CLEAN_KEYWORDS = {"에어컨청소", "삼성에어컨청소", "벽걸이에어컨셀프청소", "에어컨분해청소"}
@@ -132,47 +132,49 @@ def calc_smart_bid(keyword, monthly_search, comp_idx, avg_depth, current_bid):
     if keyword in CLEAN_KEYWORDS:
         return 70, "청소계열 최저가 고정"
 
-    # 기본 입찰가 테이블 (경쟁도 × 검색량)
+    # 기본 입찰가 테이블 (경쟁도 × 검색량) — 1페이지 상단 진입 목표
     if comp_idx == "높음":
         if monthly_search >= 50000:
-            base = 400
+            base = 2000
         elif monthly_search >= 20000:
-            base = 350
+            base = 1500
         elif monthly_search >= 10000:
-            base = 280
+            base = 1200
         elif monthly_search >= 5000:
-            base = 220
+            base = 900
         elif monthly_search >= 2000:
-            base = 180
+            base = 700
         elif monthly_search >= 500:
-            base = 150
+            base = 500
         else:
-            base = 120
+            base = 300
     elif comp_idx == "중간":
         if monthly_search >= 20000:
-            base = 200
+            base = 800
         elif monthly_search >= 5000:
-            base = 150
+            base = 500
+        elif monthly_search >= 1000:
+            base = 300
         else:
-            base = 100
+            base = 150
     else:  # 낮음
-        base = 80
+        base = 150
 
-    # 순위 보정: plAvgDepth 기반
-    # avg_depth=10 → 하위권(노출 적음) → 입찰가 높여야
+    # 순위 보정: plAvgDepth 기반 (1페이지 상단 3위 이내 목표)
+    # avg_depth=10 → 하위권(노출 적음) → 입찰가 크게 올려야
     # avg_depth=3  → 상위권(이미 노출) → 유지 or 소폭 낮춰도 됨
     if avg_depth == 0:
-        depth_mult = 1.2  # 미노출 → 적극 올리기
+        depth_mult = 1.5  # 미노출 → 대폭 올리기
     elif avg_depth <= 2:
-        depth_mult = 0.9  # 1~2위: 과비용 방지, 소폭 절감
+        depth_mult = 1.0  # 1~2위: 유지 (이미 최상단)
     elif avg_depth <= 3:
-        depth_mult = 1.0  # 3위: 이상적 위치
+        depth_mult = 1.1  # 3위: 소폭 상향 (목표는 1~2위)
     elif avg_depth <= 5:
-        depth_mult = 1.1  # 4~5위: 소폭 상승
+        depth_mult = 1.3  # 4~5위: 1페이지 상단으로 올리기
     elif avg_depth <= 7:
-        depth_mult = 1.2  # 6~7위: 상승 필요
+        depth_mult = 1.5  # 6~7위: 큰 폭 상승 필요
     else:
-        depth_mult = 1.35 # 8~10위: 적극 상승
+        depth_mult = 1.8  # 8~10위: 적극 대폭 상승
 
     smart = int(base * depth_mult)
 

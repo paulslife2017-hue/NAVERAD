@@ -47,9 +47,9 @@ TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환 (파워링크#1 기준)
 # ── 플레이스 캠페인/그룹 ──────────────────────────────────────────────────
 PLACE_CAMPAIGN_ID = "cmp-a001-06-000000010731200"
 PLACE_AG_ID       = "grp-a001-06-000000068627534"
-PLACE_DAILY_BUDGET = 10_000   # 플레이스 일 예산
+PLACE_DAILY_BUDGET = 30_000   # 플레이스 일 예산 (10만원 중 3만원)
 PLACE_MIN_BID      = 70       # 플레이스 하한
-PLACE_MAX_BID      = 3_000    # 플레이스 상한
+PLACE_MAX_BID      = 5_000    # 플레이스 상한
 PLACE_INIT_BID     = 300      # 플레이스 기본 시작 입찰가
 
 # ── 파워링크 예산/입찰 설정 ────────────────────────────────────────────────
@@ -60,8 +60,12 @@ DAILY_BUDGET = 0  # 무제한 (useDailyBudget=False)
 MIN_BID      = 70
 MAX_BID      = 1_000   # 기본 상한 (키워드별 KW_MAX_BID 우선)
 
-# 2시간 점검에서 하루 최대 상향 횟수
-MAX_UP_PER_DAY = 3
+# 내부 일 예산 모니터링 (파워링크 목표: 7만원/일, 전체 10만원 중)
+# 실제 네이버 예산 제한은 아님 - 비상 대응 임계값으로만 사용
+INTERNAL_DAILY_BUDGET = 70_000  # 파워링크 일 7만원
+
+# 2시간 점검에서 하루 최대 상향 횟수 (1페이지 진입 위해 충분히 허용)
+MAX_UP_PER_DAY = 6
 
 # ── 제외 키워드 ────────────────────────────────────────────────────────────
 EXCLUDE_KEYWORDS = {
@@ -555,15 +559,15 @@ def do_check():
             action = "CHECK_DOWN"
 
         elif kw_imp == 0 and up_today < MAX_UP_PER_DAY:
-            # ⑤ 노출 0 → +15% 상향 탐색
+            # ⑤ 노출 0 → +30% 상향 탐색 (1페이지 진입 목표로 공격적 상향)
             if cur_bid >= kw_max:
                 log(f"  [{name}] 노출0, 이미 상한({kw_max}원) → 유지")
                 continue
-            raw     = int(cur_bid * 1.15)
+            raw     = int(cur_bid * 1.30)
             new_bid = min(kw_max, max(MIN_BID, round(raw / 10) * 10))
             if new_bid <= cur_bid:
                 new_bid = min(kw_max, cur_bid + 10)
-            reason = f"노출0→+15%({up_today+1}번째,상한{kw_max}원)"
+            reason = f"노출0→+30%({up_today+1}번째,상한{kw_max}원)"
             action = "CHECK_UP"
 
         elif kw_imp == 0 and up_today >= MAX_UP_PER_DAY:
@@ -688,15 +692,15 @@ def do_check_place():
         log(f"  → 노출 있음: {cur_bid}→{new_bid}원 ({reason})")
 
     elif place_imp == 0 and up_today < MAX_UP_PER_DAY:
-        # ③ 노출 없음 → +20% (상한: PLACE_MAX_BID)
+        # ③ 노출 없음 → +35% (상한: PLACE_MAX_BID, 공격적으로 1페이지 진입)
         if cur_bid >= PLACE_MAX_BID:
             log(f"  [플레이스] 노출 0, 이미 상한({PLACE_MAX_BID}원) → 유지")
             return True
-        raw     = int(cur_bid * 1.20)
+        raw     = int(cur_bid * 1.35)
         new_bid = min(PLACE_MAX_BID, max(PLACE_MIN_BID, round(raw / 10) * 10))
         if new_bid <= cur_bid:
             new_bid = min(PLACE_MAX_BID, cur_bid + 10)
-        reason = f"노출0→+20%({up_today+1}번째,상한{PLACE_MAX_BID}원)"
+        reason = f"노출0→+35%({up_today+1}번째,상한{PLACE_MAX_BID}원)"
         action = "PLACE_CHECK_UP"
         log(f"  → 노출 없음: {cur_bid}→{new_bid}원 ({reason})")
 
@@ -884,8 +888,8 @@ def do_rank_check():
     playwright_results = {}  # keyword → on_page1 (bool)
     pw_candidates = [
         k for k in zero_kws
-        if avg_depth_map.get(k.get("keyword", ""), 99) > 5
-    ][:5]  # 최대 5개만 Playwright 확인
+        if avg_depth_map.get(k.get("keyword", ""), 99) > 3
+    ][:5]  # 최대 5개만 Playwright 확인 (3위 밖이면 체크)
 
     if pw_candidates:
         log(f"  → Playwright 1페이지 확인 시작 ({len(pw_candidates)}개 키워드)")
@@ -931,7 +935,7 @@ def do_rank_check():
 
         # 1페이지 강제 진입 조건:
         #   A. 오늘 노출0 AND 클릭0  (stats 기반)
-        #   B. plAvgDepth > 5        (평균 순위 1페이지 밖)
+        #   B. plAvgDepth > 3        (4위 밖 = 1페이지 상단 진입 필요)
         #   C. Playwright에서 미노출  (실제 확인)
         reason_parts = []
 
@@ -939,9 +943,9 @@ def do_rank_check():
         if kw_imp == 0 and kw_clk == 0:
             needs_boost = True
             reason_parts.append(f"노출0/클릭0")
-        if depth is not None and depth > 5:
+        if depth is not None and depth > 3:
             needs_boost = True
-            reason_parts.append(f"plAvgDepth={depth:.1f}(1페이지밖)")
+            reason_parts.append(f"plAvgDepth={depth:.1f}(상위3위밖)")
         if on_page1_pw is False:  # 명시적으로 False (None=미확인은 제외)
             needs_boost = True
             reason_parts.append("Playwright미노출")
