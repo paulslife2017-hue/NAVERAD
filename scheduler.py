@@ -53,9 +53,10 @@ PLACE_MAX_BID      = 3_000    # 플레이스 상한
 PLACE_INIT_BID     = 300      # 플레이스 기본 시작 입찰가
 
 # ── 파워링크 예산/입찰 설정 ────────────────────────────────────────────────
-# DAILY_BUDGET: 퀵스타트 광고그룹 dailyBudget과 동기화 (네이버 광고관리자 UI에서만 변경 가능)
-# 현재 광고그룹 dailyBudget = 50,000원 (API grp-a001-01-000000068725999 기준)
-DAILY_BUDGET = 50_000
+# DAILY_BUDGET: 퀵스타트 광고그룹 일 예산 (2026-06-24 UI에서 "제한없음"으로 변경)
+# useDailyBudget=False → 예산 무제한 운영
+# 0으로 설정 시 예산 소진율 계산 스킵 (budget_critical 조건 비활성화)
+DAILY_BUDGET = 0  # 무제한 (useDailyBudget=False)
 MIN_BID      = 70
 MAX_BID      = 1_000   # 기본 상한 (키워드별 KW_MAX_BID 우선)
 
@@ -450,8 +451,9 @@ def do_check():
     camp = api_get(f"/ncc/campaigns/{TARGET_CAMPAIGNS[0]}")
     today_used = int((camp or {}).get("totalChargeCost", 0) or 0)
     today_pct  = today_used / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
-    budget_critical = today_pct >= 90
-    log(f"  → 오늘 소진: {today_used:,}원 ({today_pct:.0f}%) {'⚠️ 90% 초과!' if budget_critical else 'OK'}")
+    budget_critical = (DAILY_BUDGET > 0) and (today_pct >= 90)
+    budget_label = f"{today_pct:.0f}%" if DAILY_BUDGET > 0 else "무제한"
+    log(f"  → 오늘 소진: {today_used:,}원 ({budget_label}) {'⚠️ 90% 초과!' if budget_critical else 'OK'}")
 
     # ── 3. stats API: 키워드 ID별 오늘 실적 (키워드 단위로 정확히 조회) ──
     kw_ids = [k["nccKeywordId"] for k in all_kws]
@@ -1087,7 +1089,7 @@ def do_terror_check():
         return True
 
     today_cost  = int((camp or {}).get("totalChargeCost", 0) or 0)
-    today_pct   = today_cost / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
+    today_pct   = today_cost / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0  # 0=무제한
 
     # ── 2. 오늘 키워드별 stats (클릭/노출 조회) ─────────────────────────
     all_kws = fetch_all_keywords()
@@ -1106,9 +1108,10 @@ def do_terror_check():
     running_hours = max(1, now_h - 7)  # 7시 ON 기준
     clk_per_hour  = total_clk / running_hours
 
+    budget_disp = f"{today_pct:.0f}%" if DAILY_BUDGET > 0 else "무제한"
     log(f"  → 오늘 {now_h}시까지: 노출{total_imp:,} / 클릭{total_clk} / "
         f"CTR {total_ctr:.2f}% / 시간당{clk_per_hour:.1f}클릭 / "
-        f"비용{total_cost:,}원({today_pct:.0f}%)")
+        f"비용{total_cost:,}원({budget_disp})")
 
     # ── 3. 이상 감지 판단 ─────────────────────────────────────────────
     terror_flags = []
