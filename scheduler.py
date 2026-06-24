@@ -33,7 +33,7 @@ BASE = "https://api.naver.com"
 # 네이버 파워링크 광고에서 노출되는 우리 사이트 도메인
 # 여러 도메인이 있을 경우 모두 추가 (하나라도 매칭되면 1페이지로 판단)
 OUR_DOMAINS = [
-    "aircon-myunghoon.vercel.app",  # 메인 랜딩페이지
+    "airconhelper.co.kr",  # 메인 광고 도착 도메인
 ]
 
 DB_PATH  = "/home/user/webapp/data/naver_ad.db"
@@ -41,7 +41,8 @@ LOG_PATH = "/home/user/webapp/data/scheduler.log"
 
 # ── 파워링크 캠페인 ───────────────────────────────────────────────────────
 PL_CAMPAIGN_IDS = ["cmp-a001-01-000000010736912"]   # 파워링크#1
-TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환
+CID_QS          = "cmp-a001-01-000000010739701"     # 퀵스타트 캠페인
+TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환 (파워링크#1 기준)
 
 # ── 플레이스 캠페인/그룹 ──────────────────────────────────────────────────
 PLACE_CAMPAIGN_ID = "cmp-a001-06-000000010731200"
@@ -52,6 +53,8 @@ PLACE_MAX_BID      = 3_000    # 플레이스 상한
 PLACE_INIT_BID     = 300      # 플레이스 기본 시작 입찰가
 
 # ── 파워링크 예산/입찰 설정 ────────────────────────────────────────────────
+# DAILY_BUDGET: 퀵스타트 광고그룹 dailyBudget과 동기화 (네이버 광고관리자 UI에서만 변경 가능)
+# 현재 광고그룹 dailyBudget = 50,000원 (API grp-a001-01-000000068725999 기준)
 DAILY_BUDGET = 50_000
 MIN_BID      = 70
 MAX_BID      = 1_000   # 기본 상한 (키워드별 KW_MAX_BID 우선)
