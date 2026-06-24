@@ -43,12 +43,13 @@ module.exports = {
       error_file: '/home/user/webapp/data/ad-on-err.log'
     },
 
-    // ── 4. 2시간 점검 (KST 09,11,13,15,17,19,21,23 = UTC 0,2,4,6,8,10,12,14) ──
+    // ── 4. 2시간 점검 (KST 09,11,15,17,19,21,23 = UTC 0,2,6,8,10,12,14) ──
+    // ※ 13시(UTC 04시)는 rank_check가 담당하므로 제외
     {
       name: 'ad-check-2h',
       script: 'python3',
       args: '/home/user/webapp/scheduler.py check',
-      cron_restart: '0 0,2,4,6,8,10,12,14 * * *',
+      cron_restart: '0 0,2,6,8,10,12,14 * * *',
       watch: false,
       autorestart: false,
       min_uptime: '1h',
@@ -56,6 +57,22 @@ module.exports = {
       exec_mode: 'fork',
       out_file: '/home/user/webapp/data/ad-check.log',
       error_file: '/home/user/webapp/data/ad-check-err.log'
+    },
+
+    // ── 5. 점심 13시 순위 점검 (KST 13:00 = UTC 04:00) ─────────────────
+    // 노출0/클릭0 키워드 → KW_MAX_BID까지 대폭 상향 + Playwright 1페이지 확인
+    {
+      name: 'ad-rank-13',
+      script: 'python3',
+      args: '/home/user/webapp/scheduler.py rank_check',
+      cron_restart: '0 4 * * *',
+      watch: false,
+      autorestart: false,
+      min_uptime: '1h',
+      instances: 1,
+      exec_mode: 'fork',
+      out_file: '/home/user/webapp/data/ad-rank.log',
+      error_file: '/home/user/webapp/data/ad-rank-err.log'
     }
   ]
 }
