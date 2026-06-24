@@ -402,14 +402,16 @@ def do_on():
     return ok_pl == len(TARGET_CAMPAIGNS) and ok_place == 1
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP C: 2시간 점검 (09~23시) — 키워드별 개별 stats 기반 조정
-# 규칙:
-#   · 키워드별 오늘 노출 개별 확인 (광고그룹 합산 X)
-#   · 노출 있음  → -10% (하한: INIT_BID)
-#   · 노출 없음  → +15% (상한: KW_MAX_BID, 하루 MAX_UP_PER_DAY회)
-#   · 예산 90%+  → 전체 -15% 비상제동
+# STEP C: 2시간 점검 — 키워드별 개별 stats 기반 CTR-aware 입찰가 조정
+#
+# 판단 우선순위:
+#   ① 예산 90%+            → 전체 -15% 비상제동
+#   ② 키워드별 CTR >= 2%   → 보호: 입찰가 유지 or +10% 상향 (클릭 잘 되는 키워드)
+#   ③ 노출 있고 CTR < 0.5% → 공격적 -15% 하락 (노출만 먹고 클릭 없음)
+#   ④ 노출 있고 CTR 0.5%~2%→ 천천히 -10% 하락 (보통 수준)
+#   ⑤ 노출 0               → +15% 상향 (노출조차 안 됨, 상한까지)
 #   · 변경된 것만 PUT (크레딧 최소화)
-# API 호출: 광고그룹 GET + 키워드 GET(그룹수만큼) + 캠페인 GET 1 + stats GET 1 + PUT N
+#   · 크레딧: 키워드 GET 1 + 캠페인 GET 1 + stats GET 1 + PUT N
 # ══════════════════════════════════════════════════════════════════════════
 def do_check():
     log("=" * 60)
@@ -432,20 +434,15 @@ def do_check():
     budget_critical = today_pct >= 90
     log(f"  → 오늘 소진: {today_used:,}원 ({today_pct:.0f}%) {'⚠️ 90% 초과!' if budget_critical else 'OK'}")
 
-    # ── 3. stats API: 키워드 ID별 오늘 실적 (1~2회 호출) ────────────────
-    # 키워드 ID + TOTAL은 clk=0 이슈 있으나, 노출(impCnt) 확인에는 문제없음
-    # 더 정확하게: 광고그룹 ID + DAY로 조회해서 키워드와 매핑
-    # 퀵스타트/틈새 각 그룹별로 따로 조회
-    ag_ids = list({k["_agId"] for k in all_kws})
-    ag_stats = fetch_stats(ag_ids, today_str)  # { ag_id → {imp,clk,cost} }
+    # ── 3. stats API: 키워드 ID별 오늘 실적 (키워드 단위로 정확히 조회) ──
+    kw_ids = [k["nccKeywordId"] for k in all_kws]
+    kw_stats = fetch_stats(kw_ids, today_str)  # { kw_id → {imp,clk,cost} }
 
-    total_imp  = sum(v["imp"]  for v in ag_stats.values())
-    total_clk  = sum(v["clk"]  for v in ag_stats.values())
-    total_cost = sum(v["cost"] for v in ag_stats.values())
-    log(f"  → 오늘 전체: 노출 {total_imp:,}회 / 클릭 {total_clk}회 / 비용 {total_cost:,}원")
-    for ag_id, st in ag_stats.items():
-        ag_name = next((k.get("_agName", ag_id) for k in all_kws if k["_agId"] == ag_id), ag_id[-8:])
-        log(f"     [{ag_id[-8:]}] 노출{st['imp']:,} 클릭{st['clk']} 비용{st['cost']:,}원")
+    total_imp  = sum(v["imp"]  for v in kw_stats.values())
+    total_clk  = sum(v["clk"]  for v in kw_stats.values())
+    total_cost = sum(v["cost"] for v in kw_stats.values())
+    total_ctr  = total_clk / total_imp * 100 if total_imp > 0 else 0
+    log(f"  → 오늘 전체: 노출 {total_imp:,}회 / 클릭 {total_clk}회 / CTR {total_ctr:.2f}% / 비용 {total_cost:,}원")
 
     # ── 4. 오늘 키워드별 상향 횟수 (schedule_log) ───────────────────────
     conn_r = sqlite3.connect(DB_PATH)
@@ -456,14 +453,10 @@ def do_check():
     ).fetchall()
     conn_r.close()
     up_counts = {r[0]: r[1] for r in up_rows}
-
     up_total = sum(up_counts.values())
-    log(f"  → 오늘 상향 현황: 총 {up_total}건 ({dict(list(up_counts.items())[:5])})")
+    log(f"  → 오늘 상향 현황: 총 {up_total}건")
 
-    # ── 5. 키워드별 판단 ─────────────────────────────────────────────────
-    # 핵심: 광고그룹 노출이 있어도 해당 키워드가 노출됐는지는 알 수 없음
-    # → 노출 있는 그룹 키워드는 "일단 노출됨"으로 보고 조금 내리기
-    # → 노출 없는 그룹 키워드는 "노출 안 됨"으로 보고 조금 올리기
+    # ── 5. 키워드별 판단 (CTR-aware) ────────────────────────────────────
     to_change = []
     for kw in all_kws:
         name    = kw.get("keyword", "")
@@ -475,56 +468,89 @@ def do_check():
         if status != "ELIGIBLE":
             continue
 
-        init_bid  = INIT_BIDS.get(name, MIN_BID)
-        kw_max    = KW_MAX_BID.get(name, MAX_BID)
-        ag_imp    = ag_stats.get(ag_id, {}).get("imp", 0)   # 이 키워드가 속한 그룹 노출
-        up_today  = up_counts.get(name, 0)
+        init_bid = INIT_BIDS.get(name, MIN_BID)
+        kw_max   = KW_MAX_BID.get(name, MAX_BID)
+        up_today = up_counts.get(name, 0)
+
+        st      = kw_stats.get(kw_id, {})
+        kw_imp  = st.get("imp", 0)
+        kw_clk  = st.get("clk", 0)
+        kw_ctr  = kw_clk / kw_imp * 100 if kw_imp > 0 else 0
 
         new_bid = cur_bid
         reason  = ""
         action  = ""
 
         if budget_critical:
-            # ① 예산 90% → -15% 비상
+            # ① 예산 90% 초과 → -15% 비상제동
             raw     = int(cur_bid * 0.85)
             new_bid = max(MIN_BID, round(raw / 10) * 10)
             reason  = f"예산{today_pct:.0f}%초과→비상-15%"
             action  = "CHECK_DOWN"
 
-        elif ag_imp > 0:
-            # ② 이 그룹에 노출 있음 → 천천히 낮춰서 최저가 탐색
-            # 이미 INIT_BID 하한에 닿아 있으면 유지
+        elif kw_imp > 0 and kw_ctr >= 2.0:
+            # ② CTR 2% 이상 → 클릭 잘 되는 키워드: 보호 + 상향 탐색
+            if cur_bid >= kw_max:
+                log(f"  [{name}] ★CTR {kw_ctr:.1f}%(노출{kw_imp}/클릭{kw_clk}), 이미 상한({kw_max}원) → 유지")
+                continue
+            raw     = int(cur_bid * 1.10)
+            new_bid = min(kw_max, max(init_bid, round(raw / 10) * 10))
+            if new_bid <= cur_bid:
+                new_bid = min(kw_max, cur_bid + 10)
+            if new_bid <= cur_bid:
+                log(f"  [{name}] ★CTR {kw_ctr:.1f}%, 상한({kw_max}원) → 유지")
+                continue
+            reason = f"★CTR{kw_ctr:.1f}%(노출{kw_imp}/클릭{kw_clk})→+10%상향"
+            action = "CHECK_UP"
+
+        elif kw_imp > 0 and kw_ctr >= 0.5:
+            # ③ CTR 0.5%~2% → 보통: 천천히 -10% 하락 (하한 보호)
             if cur_bid <= init_bid:
-                log(f"  [{name}] 그룹노출{ag_imp}회, 이미 하한({init_bid}원) → 유지")
+                log(f"  [{name}] CTR {kw_ctr:.1f}%(노출{kw_imp}/클릭{kw_clk}), 하한({init_bid}원) → 유지")
                 continue
             raw     = int(cur_bid * 0.90)
             new_bid = max(init_bid, round(raw / 10) * 10)
             if new_bid >= cur_bid:
                 new_bid = max(init_bid, cur_bid - 10)
             if new_bid >= cur_bid:
-                log(f"  [{name}] 그룹노출{ag_imp}회, 하한({init_bid}원) → 유지")
+                log(f"  [{name}] CTR {kw_ctr:.1f}%, 하한({init_bid}원) → 유지")
                 continue
-            reason = f"그룹노출{ag_imp}회→-10%(하한{init_bid}원)"
+            reason = f"CTR{kw_ctr:.1f}%(노출{kw_imp}/클릭{kw_clk})→-10%(하한{init_bid}원)"
             action = "CHECK_DOWN"
 
-        elif ag_imp == 0 and up_today < MAX_UP_PER_DAY:
-            # ③ 이 그룹 노출 없음 → 올려서 탐색
+        elif kw_imp > 0 and kw_ctr < 0.5:
+            # ④ 노출 있지만 CTR 0.5% 미만 → 공격적 -15% (노출만 먹는 키워드)
+            if cur_bid <= init_bid:
+                log(f"  [{name}] CTR {kw_ctr:.1f}%(노출{kw_imp}/클릭0), 하한({init_bid}원) → 유지")
+                continue
+            raw     = int(cur_bid * 0.85)
+            new_bid = max(init_bid, round(raw / 10) * 10)
+            if new_bid >= cur_bid:
+                new_bid = max(init_bid, cur_bid - 10)
+            if new_bid >= cur_bid:
+                log(f"  [{name}] CTR 저조, 하한({init_bid}원) → 유지")
+                continue
+            reason = f"CTR{kw_ctr:.1f}%(노출{kw_imp}/클릭{kw_clk})→-15%(하한{init_bid}원)"
+            action = "CHECK_DOWN"
+
+        elif kw_imp == 0 and up_today < MAX_UP_PER_DAY:
+            # ⑤ 노출 0 → +15% 상향 탐색
             if cur_bid >= kw_max:
-                log(f"  [{name}] 그룹노출0, 이미 상한({kw_max}원) → 유지")
+                log(f"  [{name}] 노출0, 이미 상한({kw_max}원) → 유지")
                 continue
             raw     = int(cur_bid * 1.15)
             new_bid = min(kw_max, max(MIN_BID, round(raw / 10) * 10))
             if new_bid <= cur_bid:
                 new_bid = min(kw_max, cur_bid + 10)
-            reason = f"그룹노출0→+15%({up_today+1}번째,상한{kw_max}원)"
+            reason = f"노출0→+15%({up_today+1}번째,상한{kw_max}원)"
             action = "CHECK_UP"
 
-        elif ag_imp == 0 and up_today >= MAX_UP_PER_DAY:
-            log(f"  [{name}] 그룹노출0, 오늘 상향 {up_today}회 한도 → 유지")
+        elif kw_imp == 0 and up_today >= MAX_UP_PER_DAY:
+            log(f"  [{name}] 노출0, 오늘 상향 {up_today}회 한도 → 유지")
             continue
 
         else:
-            log(f"  [{name}] 그룹노출{ag_imp}회 bid={cur_bid}원 → 유지")
+            log(f"  [{name}] 노출{kw_imp}회 bid={cur_bid}원 → 유지")
             continue
 
         if new_bid != cur_bid:
