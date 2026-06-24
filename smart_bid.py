@@ -10,11 +10,23 @@
 import hashlib, hmac, base64, time, requests, json, sqlite3, os, sys
 from datetime import datetime
 
-# ── 인증 정보 ───────────────────────────────────────────────────────────────
-AL  = "0100000000e8a9e5c719ef2ea8318c370686c95f2e7a575fd22e8075980031db54654aa701"
-SK  = "AQAAAADoqeXHGe8uqDGMNwaGyV8ub0ko3GK/zB5aWTFEsaWJMw=="
-CID = "4412351"
+# ── NAVER Search Ad API credentials ────────────────────────────────────────
+# Set these as environment variables. Never commit API keys to source code.
+AL = os.environ.get("NAVER_ACCESS_LICENSE", os.environ.get("NAVER_API_KEY", "")).strip()
+SK = os.environ.get("NAVER_SECRET_KEY", os.environ.get("NAVER_API_SECRET", "")).strip()
+CID = os.environ.get("NAVER_CUSTOMER_ID", "").strip()
 BASE = "https://api.naver.com"
+
+def require_naver_credentials():
+    missing = []
+    if not AL:
+        missing.append("NAVER_ACCESS_LICENSE")
+    if not SK:
+        missing.append("NAVER_SECRET_KEY")
+    if not CID:
+        missing.append("NAVER_CUSTOMER_ID")
+    if missing:
+        raise RuntimeError("Missing NAVERAD environment variables: " + ", ".join(missing))
 
 DB_PATH = "/home/user/webapp/data/naver_ad.db"
 LOG_PATH = "/home/user/webapp/data/smart_bid.log"
@@ -40,6 +52,7 @@ def log(msg):
 
 # ── HMAC 서명 ──────────────────────────────────────────────────────────────
 def sig(ts, method, uri):
+    require_naver_credentials()
     return base64.b64encode(
         hmac.new(SK.encode(), f"{ts}.{method}.{uri}".encode(), hashlib.sha256).digest()
     ).decode()

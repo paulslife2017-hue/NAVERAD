@@ -4,11 +4,33 @@ import { cors } from 'hono/cors'
 const app = new Hono()
 app.use('*', cors())
 
-// ── 인증 ──────────────────────────────────────────────────────────────────────
-const AL  = '0100000000e8a9e5c719ef2ea8318c370686c95f2e7a575fd22e8075980031db54654aa701'
-const SK  = 'AQAAAADoqeXHGe8uqDGMNwaGyV8ub0ko3GK/zB5aWTFEsaWJMw=='
-const CID = '4412351'
+// ── NAVER Search Ad API credentials ──────────────────────────────────────────
+// Set these as environment variables. Never commit API keys to source code.
 const API = 'https://api.naver.com'
+
+type NaverCreds = {
+  accessLicense: string
+  secretKey: string
+  customerId: string
+}
+
+function getProcessEnv(): Record<string, string | undefined> {
+  return typeof process !== 'undefined' ? process.env : {}
+}
+
+function getNaverCreds(): NaverCreds {
+  const env = getProcessEnv()
+  const accessLicense = env.NAVER_ACCESS_LICENSE || env.NAVER_API_KEY || ''
+  const secretKey = env.NAVER_SECRET_KEY || env.NAVER_API_SECRET || ''
+  const customerId = env.NAVER_CUSTOMER_ID || ''
+  const missing = [
+    ['NAVER_ACCESS_LICENSE', accessLicense],
+    ['NAVER_SECRET_KEY', secretKey],
+    ['NAVER_CUSTOMER_ID', customerId],
+  ].filter(([, value]) => !value).map(([name]) => name)
+  if (missing.length) throw new Error('Missing NAVERAD environment variables: ' + missing.join(', '))
+  return { accessLicense, secretKey, customerId }
+}
 
 // ── 캐시 — 크레딧 절약 최우선 ──────────────────────────────────────────────
 const cache: Record<string, { data: unknown; ts: number }> = {}
@@ -38,7 +60,7 @@ const REGIONS    = [...REGIONS_NE, ...REGIONS_SW]
 
 async function sign(ts: string, method: string, uri: string) {
   const enc = new TextEncoder()
-  const key = await crypto.subtle.importKey('raw', enc.encode(SK), { name:'HMAC', hash:'SHA-256' }, false, ['sign'])
+  const key = await crypto.subtle.importKey('raw', enc.encode(getNaverCreds().secretKey), { name:'HMAC', hash:'SHA-256' }, false, ['sign'])
   const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${ts}.${method}.${uri}`))
   return btoa(String.fromCharCode(...new Uint8Array(sig)))
 }
@@ -49,8 +71,9 @@ async function nGet(uri: string, params?: Record<string, string>, ttl = TTL_1H) 
   const url = new URL(API + uri)
   if (params) Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v))
   const ts = String(Date.now())
+  const creds = getNaverCreds()
   const res = await fetch(url.toString(), {
-    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'GET',uri) }
+    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':creds.accessLicense, 'X-Customer':creds.customerId, 'X-Signature': await sign(ts,'GET',uri) }
   })
   if (!res.ok) throw new Error(`GET ${uri} → ${res.status}`)
   const data = await res.json()
@@ -60,9 +83,10 @@ async function nGet(uri: string, params?: Record<string, string>, ttl = TTL_1H) 
 
 async function nPut(uri: string, body: unknown) {
   const ts = String(Date.now())
+  const creds = getNaverCreds()
   const res = await fetch(API + uri, {
     method:'PUT', body: JSON.stringify(body),
-    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'PUT',uri) }
+    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':creds.accessLicense, 'X-Customer':creds.customerId, 'X-Signature': await sign(ts,'PUT',uri) }
   })
   if (!res.ok) throw new Error(`PUT ${uri} → ${res.status} ${await res.text()}`)
   Object.keys(cache).forEach(k => { if (k.includes('/ncc/')) delete cache[k] })
@@ -82,8 +106,9 @@ async function nStatsKw(ids: string[], since: string, until: string, ckey: strin
     timeUnit: 'TOTAL',
   })
   const ts = String(Date.now())
-  const res = await fetch(`${API}${uri}?${params}`, {
-    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'GET',uri) }
+  const creds = getNaverCreds()
+  const res = await fetch(API + uri + '?' + params, {
+    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':creds.accessLicense, 'X-Customer':creds.customerId, 'X-Signature': await sign(ts,'GET',uri) }
   })
   if (!res.ok) throw new Error(`stats → ${res.status}`)
   const d: any = await res.json()
@@ -105,8 +130,9 @@ async function nStatsDay(agIds: string[], since: string, until: string, ckey: st
     // 광고그룹 ID로 조회 시 date가 정상 반환됨
   })
   const ts = String(Date.now())
-  const res = await fetch(`${API}${uri}?${params}`, {
-    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':AL, 'X-Customer':CID, 'X-Signature': await sign(ts,'GET',uri) }
+  const creds = getNaverCreds()
+  const res = await fetch(API + uri + '?' + params, {
+    headers: { 'Content-Type':'application/json; charset=UTF-8', 'X-Timestamp':ts, 'X-API-KEY':creds.accessLicense, 'X-Customer':creds.customerId, 'X-Signature': await sign(ts,'GET',uri) }
   })
   if (!res.ok) throw new Error(`statsDay → ${res.status}`)
   const d: any = await res.json()
