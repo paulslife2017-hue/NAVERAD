@@ -233,7 +233,7 @@ app.get('/api/data', async (c) => {
       }
     })
 
-    const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010736912') || camps[0]
+    const mainCamp = camps.find((c: any) => c.nccCampaignId === 'cmp-a001-01-000000010739701') || camps[0]
     const isOn = mainCamp && !mainCamp.userLock && mainCamp.status === 'ELIGIBLE'
 
     const dailyBudget    = Number(mainCamp?.dailyBudget || 50000)

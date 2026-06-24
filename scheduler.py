@@ -52,9 +52,9 @@ DB_PATH  = "/home/user/webapp/data/naver_ad.db"
 LOG_PATH = "/home/user/webapp/data/scheduler.log"
 
 # ── 파워링크 캠페인 ───────────────────────────────────────────────────────
-PL_CAMPAIGN_IDS = ["cmp-a001-01-000000010736912"]   # 파워링크#1
 CID_QS          = "cmp-a001-01-000000010739701"     # 퀵스타트 캠페인
-TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환 (파워링크#1 기준)
+PL_CAMPAIGN_IDS = [CID_QS]                         # 현재 운영 중인 파워링크 캠페인
+TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS                 # 하위 호환
 
 # ── 플레이스 캠페인/그룹 ──────────────────────────────────────────────────
 PLACE_CAMPAIGN_ID = "cmp-a001-06-000000010731200"
