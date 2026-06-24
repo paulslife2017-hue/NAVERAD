@@ -33,8 +33,7 @@ BASE = "https://api.naver.com"
 # 네이버 파워링크 광고에서 노출되는 우리 사이트 도메인
 # 여러 도메인이 있을 경우 모두 추가 (하나라도 매칭되면 1페이지로 판단)
 OUR_DOMAINS = [
-    "juntechkorea.com",     # 기본 도메인 (실제 도착 URL로 변경 필요)
-    # "blog.naver.com/your_blog",  # 네이버 블로그로 광고하는 경우 추가
+    "aircon-myunghoon.vercel.app",  # 메인 랜딩페이지
 ]
 
 DB_PATH  = "/home/user/webapp/data/naver_ad.db"
@@ -429,6 +428,10 @@ def do_on():
 def do_check():
     log("=" * 60)
     log(f"▶ 2시간 점검 ({datetime.now().strftime('%H:%M')} KST)")
+
+    # ── 0. 클릭 테러 선제 감지 (매 2시간 점검 시 자동 체크) ─────────────
+    # 테러 감지되면 비상 입찰가 하락 후 나머지 로직은 계속 실행
+    do_terror_check()
 
     run_date  = datetime.now().strftime("%Y-%m-%d")
     today_str = run_date
@@ -1002,6 +1005,189 @@ def do_rank_check():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# STEP G: 클릭 테러 감지 + 자동 비상 대응
+#
+# 네이버 NCC API 한계:
+#   - invalidClkCnt (무효클릭수) API 미제공
+#   - 실시간 IP별 클릭 조회 불가
+#   → 네이버가 자체 무효클릭 필터링은 하지만 API로 확인 불가
+#
+# 우리가 할 수 있는 것:
+#   ① 비정상 CTR 감지: 시간당 클릭이 평소의 N배 이상 → 비상 입찰가 하락
+#   ② 예산 소진 속도 감지: 평소보다 빠른 소진 → 즉시 입찰가 -50% 비상
+#   ③ 현재 시각 비용이 전날 같은 시각 대비 3배 이상 → 테러 의심
+#   ④ 입찰가를 MIN_BID까지 내려서 추가 클릭 차단 (비용 최소화)
+#
+# 실행: do_check() 내부에서 매 2시간마다 자동 체크
+#       또는 force_terror_check 인수로 즉시 실행
+# ══════════════════════════════════════════════════════════════════════════
+
+# 클릭 테러 감지 임계값
+TERROR_CTR_THRESHOLD  = 15.0   # CTR이 15% 이상이면 클릭테러 의심 (정상 광고 CTR 1~3%)
+TERROR_CLK_PER_HOUR   = 20     # 시간당 클릭 20회 이상이면 의심
+TERROR_COST_MULTIPLIER = 3.0   # 전날 같은 시간 대비 비용이 3배 이상이면 의심
+TERROR_EMERGENCY_BID  = 70     # 테러 감지 시 입찰가를 이 값으로 낮춤 (MIN_BID)
+
+def fetch_hourly_stats(ids, date_str, hour):
+    """특정 날짜 특정 시간의 stats 조회 (시간 단위)"""
+    if not ids:
+        return {}
+    uri = "/stats"
+    params = urllib.parse.urlencode({
+        "ids":       ",".join(ids),
+        "fields":    '["impCnt","clkCnt","salesAmt"]',
+        "timeRange": json.dumps({"since": date_str, "until": date_str}),
+        "timeUnit":  "HOUR",
+    })
+    ts = str(int(time.time() * 1000))
+    try:
+        r = requests.get(BASE + uri + "?" + params,
+                         headers=_hdrs(ts, "GET", uri), timeout=20)
+        if r.status_code == 200:
+            result = {}
+            for item in (r.json().get("data") or []):
+                sid = item.get("id", "")
+                # 시간별 데이터에서 특정 hour 추출
+                hourly = item.get("statData") or item
+                # HOUR 단위는 배열 형태일 수 있음
+                if isinstance(hourly, list):
+                    h_data = hourly[hour] if hour < len(hourly) else {}
+                else:
+                    h_data = hourly  # DAY 단위로 돌아온 경우
+                result[sid] = {
+                    "imp":  int(h_data.get("impCnt",   0) or 0),
+                    "clk":  int(h_data.get("clkCnt",   0) or 0),
+                    "cost": int(h_data.get("salesAmt", 0) or 0),
+                }
+            return result
+    except Exception as e:
+        log(f"  ⚠️ hourly stats 오류: {e}")
+    return {}
+
+
+def do_terror_check():
+    """
+    클릭 테러 감지 + 비상 대응
+    비정상 클릭 감지 시 모든 키워드 입찰가를 MIN_BID로 즉시 하락
+    반환: True=정상, False=테러 감지 (비상 조치 실행)
+    """
+    log("-" * 60)
+    log(f"▶ [클릭테러 감지] 체크 시작 ({datetime.now().strftime('%H:%M')} KST)")
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    now_h     = datetime.now().hour
+
+    # ── 1. 오늘 현재까지 캠페인 전체 stats ─────────────────────────────
+    camp = api_get(f"/ncc/campaigns/{TARGET_CAMPAIGNS[0]}")
+    if not camp:
+        log("  ⚠️ 캠페인 조회 실패 → 스킵")
+        return True
+
+    today_cost  = int((camp or {}).get("totalChargeCost", 0) or 0)
+    today_pct   = today_cost / DAILY_BUDGET * 100 if DAILY_BUDGET > 0 else 0
+
+    # ── 2. 오늘 키워드별 stats (클릭/노출 조회) ─────────────────────────
+    all_kws = fetch_all_keywords()
+    if not all_kws:
+        return True
+
+    kw_ids   = [k["nccKeywordId"] for k in all_kws]
+    kw_stats = fetch_stats(kw_ids, today_str)
+
+    total_imp  = sum(v["imp"]  for v in kw_stats.values())
+    total_clk  = sum(v["clk"]  for v in kw_stats.values())
+    total_cost = sum(v["cost"] for v in kw_stats.values())
+    total_ctr  = total_clk / total_imp * 100 if total_imp > 0 else 0
+
+    # 시간당 클릭 (운영 시간 기준)
+    running_hours = max(1, now_h - 7)  # 7시 ON 기준
+    clk_per_hour  = total_clk / running_hours
+
+    log(f"  → 오늘 {now_h}시까지: 노출{total_imp:,} / 클릭{total_clk} / "
+        f"CTR {total_ctr:.2f}% / 시간당{clk_per_hour:.1f}클릭 / "
+        f"비용{total_cost:,}원({today_pct:.0f}%)")
+
+    # ── 3. 이상 감지 판단 ─────────────────────────────────────────────
+    terror_flags = []
+
+    # A. CTR 이상
+    if total_imp > 100 and total_ctr >= TERROR_CTR_THRESHOLD:
+        terror_flags.append(f"비정상CTR {total_ctr:.1f}%(≥{TERROR_CTR_THRESHOLD}%)")
+
+    # B. 시간당 클릭 이상
+    if clk_per_hour >= TERROR_CLK_PER_HOUR:
+        terror_flags.append(f"시간당클릭{clk_per_hour:.0f}회(≥{TERROR_CLK_PER_HOUR}회)")
+
+    # C. 예산 50% 이상 소진인데 아직 오전 (11시 이전)
+    if today_pct >= 50 and now_h < 11:
+        terror_flags.append(f"오전{now_h}시에 예산{today_pct:.0f}%소진")
+
+    # D. 예산 80% 이상 소진인데 13시 이전
+    if today_pct >= 80 and now_h < 13:
+        terror_flags.append(f"{now_h}시에 예산{today_pct:.0f}%소진(80%+)")
+
+    if not terror_flags:
+        log(f"  ✅ 클릭 테러 감지 없음 (CTR {total_ctr:.2f}% / 시간당{clk_per_hour:.1f}클릭)")
+        return True
+
+    # ── 4. 테러 감지! 비상 대응: 모든 키워드 입찰가를 MIN_BID로 ────────
+    log(f"  🚨 클릭 테러 의심 감지!")
+    for flag in terror_flags:
+        log(f"    → {flag}")
+    log(f"  🚨 비상 조치: 모든 키워드 입찰가를 {TERROR_EMERGENCY_BID}원으로 하락!")
+
+    # DB에 테러 감지 기록
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO schedule_log (run_at,action,campaign,success,detail) VALUES (?,?,?,?,?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "TERROR_DETECTED",
+         TARGET_CAMPAIGNS[0], 1,
+         f"CTR={total_ctr:.2f}% clk/h={clk_per_hour:.1f} cost={today_cost:,}원 flags={','.join(terror_flags)}")
+    )
+    conn.commit()
+    conn.close()
+
+    # 모든 활성 키워드 입찰가를 TERROR_EMERGENCY_BID로 즉시 하락
+    ok = fail = skip = 0
+    for kw in all_kws:
+        name    = kw.get("keyword", "")
+        kw_id   = kw.get("nccKeywordId", "")
+        ag_id   = kw.get("_agId", "")
+        cur_bid = int(kw.get("bidAmt", MIN_BID))
+        status  = kw.get("status", "")
+
+        if status != "ELIGIBLE":
+            skip += 1
+            continue
+        if cur_bid <= TERROR_EMERGENCY_BID:
+            skip += 1
+            continue
+
+        uri = f"/ncc/keywords/{kw_id}"
+        sc, res = api_put(
+            uri,
+            {"nccAdgroupId": ag_id, "useGroupBidAmt": False, "bidAmt": TERROR_EMERGENCY_BID},
+            "nccAdgroupId,useGroupBidAmt,bidAmt",
+        )
+        if sc == 200:
+            log(f"  🚨 [{name}] {cur_bid}↓{TERROR_EMERGENCY_BID}원 (테러비상)")
+            push_history(name, cur_bid, TERROR_EMERGENCY_BID,
+                         f"테러비상↓({','.join(terror_flags)})")
+            db_log("TERROR_DOWN", name, True,
+                   f"cur={cur_bid}→{TERROR_EMERGENCY_BID} flags={','.join(terror_flags)}")
+            ok += 1
+        else:
+            log(f"  ❌ [{name}] 비상하락 실패[{sc}]: {str(res)[:60]}")
+            fail += 1
+        time.sleep(0.1)
+
+    log(f"  🚨 비상 조치 완료: 하락{ok}개 / 실패{fail}개 / 스킵{skip}개")
+    log(f"  ⚠️  네이버 고객센터 신고 권장: https://saedu.naver.com/help/qna/create.naver")
+    clear_ncc_cache()
+    return False  # 테러 감지됨
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 메인
 # ══════════════════════════════════════════════════════════════════════════
 def main():
@@ -1038,6 +1224,14 @@ def main():
     elif arg == "force_rank_check":
         # 테스트용: 시간 무관 순위 점검 강제 실행
         do_rank_check()
+
+    elif arg == "terror_check":
+        # 클릭 테러 감지만 실행 (비상 조치 포함)
+        do_terror_check()
+
+    elif arg == "force_terror_check":
+        # 테스트용: 시간 무관 테러 감지 강제 실행
+        do_terror_check()
 
     elif arg == "force_check":
         # 테스트용: 시간 무관 전체(파워링크+플레이스) 강제 실행
