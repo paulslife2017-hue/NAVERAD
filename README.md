@@ -43,6 +43,7 @@ NAVER_API_SECRET
 ## Security Notes
 
 - API keys must never be committed to GitHub.
-- The old keys that were previously committed should be revoked and reissued in NAVER Search Ad.
-- After setting new environment variables, redeploy the dashboard and restart PM2 scheduler processes.
+- If you choose to keep the existing NAVER API keys, put those same values in environment variables instead of source code.
+- Reissuing exposed keys is still recommended, but not required for this code change.
+- After setting environment variables, redeploy the dashboard and restart PM2 scheduler processes.
 - Protect write endpoints such as `/api/bid`, `/api/history-write`, and `/api/cache` before exposing this publicly.
