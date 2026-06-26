@@ -23,11 +23,23 @@
 import hashlib, hmac, base64, time, requests, json, sqlite3, os, sys, urllib.parse
 from datetime import datetime, timedelta
 
-# ── 인증 ──────────────────────────────────────────────────────────────────
-AL   = "0100000000e8a9e5c719ef2ea8318c370686c95f2e7a575fd22e8075980031db54654aa701"
-SK   = "AQAAAADoqeXHGe8uqDGMNwaGyV8ub0ko3GK/zB5aWTFEsaWJMw=="
-CID  = "4412351"
+# ── NAVER Search Ad API credentials ────────────────────────────────────────
+# Set these as environment variables. Never commit API keys to source code.
+AL = os.environ.get("NAVER_ACCESS_LICENSE", os.environ.get("NAVER_API_KEY", "")).strip()
+SK = os.environ.get("NAVER_SECRET_KEY", os.environ.get("NAVER_API_SECRET", "")).strip()
+CID = os.environ.get("NAVER_CUSTOMER_ID", "").strip()
 BASE = "https://api.naver.com"
+
+def require_naver_credentials():
+    missing = []
+    if not AL:
+        missing.append("NAVER_ACCESS_LICENSE")
+    if not SK:
+        missing.append("NAVER_SECRET_KEY")
+    if not CID:
+        missing.append("NAVER_CUSTOMER_ID")
+    if missing:
+        raise RuntimeError("Missing NAVERAD environment variables: " + ", ".join(missing))
 
 # ── 광고 도착 도메인 (Playwright 순위 확인용) ─────────────────────────────
 # 네이버 파워링크 광고에서 노출되는 우리 사이트 도메인
@@ -40,9 +52,9 @@ DB_PATH  = "/home/user/webapp/data/naver_ad.db"
 LOG_PATH = "/home/user/webapp/data/scheduler.log"
 
 # ── 파워링크 캠페인 ───────────────────────────────────────────────────────
-PL_CAMPAIGN_IDS = ["cmp-a001-01-000000010736912"]   # 파워링크#1
 CID_QS          = "cmp-a001-01-000000010739701"     # 퀵스타트 캠페인
-TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS  # 하위 호환 (파워링크#1 기준)
+PL_CAMPAIGN_IDS = [CID_QS]                         # 현재 운영 중인 파워링크 캠페인
+TARGET_CAMPAIGNS = PL_CAMPAIGN_IDS                 # 하위 호환
 
 # ── 플레이스 캠페인/그룹 ──────────────────────────────────────────────────
 PLACE_CAMPAIGN_ID = "cmp-a001-06-000000010731200"
@@ -164,6 +176,7 @@ def log(msg):
 
 # ── API 헬퍼 ──────────────────────────────────────────────────────────────
 def _sig(ts, method, uri):
+    require_naver_credentials()
     return base64.b64encode(
         hmac.new(SK.encode(), f"{ts}.{method}.{uri}".encode(), hashlib.sha256).digest()
     ).decode()
